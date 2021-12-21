@@ -1,0 +1,452 @@
+#+TITLE: GFUSE: a Gerbil FUSE interface
+
+* GFUSE for Dummies
+
+I have to make FUSE align with Gerbil and am fairly dumb when it comes to FUSE
+itself.
+
+This start out essentially as a log of my trials and errors while trying to
+bring FUSE to both a REPL for development and a simple executable for
+production.
+
+** Hello! ~examples/hello.ss~
+
+So ~libfuse~ has ~hello.c~, which is a good place to get started. Very simple,
+we have a pretend file with pretend contents in the root directory.
+
+We use [[file:doc/ffi.org][Gerbil's FFI interface]].
+
+*** Try ~_main()~
+
+FFI time. Turn ~main()~ into ~_main()~ and let's import that entire C file.
+
+#+begin_src c
+int main(int argc, char *argv[]) { int ret = _main(argc, argv); return ret; }
+#+end_src
+
+Running the *C* version with ~--help~ tells us that ~-d~ means debug and
+forground. We want that. Also because mount requires root, ~allow_other~.
+
+So we'll pretend to run it as follows.
+
+#+begin_src shell
+mkdir -p /tmp/gfuse-fest
+./hello -d -o allow_other /tmp/gfuse-test
+#+end_src
+
+Here's the ~./examples/try-main-hello.ss~.
+
+#+begin_src scheme :tangle ./examples/try-main-hello.ss :mkdirp t
+(export try-main)
+(import :std/foreign :gerbil/gambit/foreign :gerbil/gambit/threads)
+
+(begin-ffi (try-main)
+  (c-declare "#include \"hello.c\"")
+  (define-c-lambda try-main () int "
+char *argv[] = {
+   (char*)\"./hello\",
+   (char*)\"-d\",
+   (char*)\"-o\",
+   (char*)\"allow_other\",
+   (char*)\"/tmp/gfuse-test\",
+   NULL
+};
+
+fprintf(stderr, \"gfuse: This is gerbil main! %s\\n\", argv[0]);
+
+int res = _main(5, argv);
+___return(res);"))
+
+#+end_src
+
+Let's give it a go!
+
+#+begin_src shell
+./build.ss && sudo GERBIL_PATH=$HOME/.gerbil gxi -e "(begin (import :drewc/fuse/examples/try-main-hello) (try-main))" -
+#+end_src
+#+begin_quote
+removed './examples/try-main-hello__0.o1'
+removed './examples/try-main-hello__rt.o1'
+removed './examples/try-main-hello.ssi'
+removed './examples/try-main-hello.ssxi.ss'
+... compile examples/try-main-hello
+guile: warning: failed to install locale
+guile: warning: failed to install locale
+... copy examples/try-main-hello__0.o1 to ~/.gerbil/lib/drewc/fuse/examples/try-main-hello__0.o1
+... copy examples/try-main-hello__rt.o1 to ~/.gerbil/lib/drewc/fuse/examples/try-main-hello__rt.o1
+... copy examples/try-main-hello.ssi to ~/.gerbil/lib/drewc/fuse/examples/try-main-hello.ssi
+... copy examples/try-main-hello.ssxi.ss to ~/.gerbil/lib/drewc/fuse/examples/try-main-hello.ssxi.ss
+gfuse: This is gerbil main! ./hello
+hello: This is main! ./hello
+FUSE library version: 3.10.5
+nullpath_ok: 0
+unique: 2, opcode: INIT (26), nodeid: 0, insize: 56, pid: 0
+INIT: 7.34
+flags=0x33fffffb
+max_readahead=0x00020000
+   INIT: 7.31
+   flags=0x0040f039
+   max_readahead=0x00020000
+   max_write=0x00100000
+   max_background=0
+   congestion_threshold=0
+   time_gran=1
+   unique: 2, success, outsize: 80
+#+end_quote
+
+It just hangs there at the REPL as ~-d~ specifies we don't ~fork()~ a process. But, does it work?
+
+#+begin_src shell
+^Z
+[1]+  Stopped                 sudo GERBIL_PATH=~drewc/.gerbil gxi -e "(begin (import :drewc/fuse/examples/try-main-hello) (try-main))" -
+$ bg
+[1]+ sudo GERBIL_PATH=~drewc/.gerbil gxi -e "(begin (import :drewc/fuse/examples/try-main-hello) (try-main))" - &
+$ cat /tmp/gfuse-test/hello
+unique: 4, opcode: LOOKUP (1), nodeid: 1, insize: 46, pid: 12839
+LOOKUP /hello
+getattr[NULL] /hello
+   NODEID: 2
+   unique: 4, success, outsize: 144
+unique: 6, opcode: OPEN (14), nodeid: 2, insize: 48, pid: 12839
+open flags: 0x8000 /hello
+   open[0] flags: 0x8000 /hello
+   unique: 6, success, outsize: 32
+unique: 8, opcode: READ (15), nodeid: 2, insize: 80, pid: 12839
+read[0] 4096 bytes from 0 flags: 0x8000
+   read[0] 13 bytes from 0
+   unique: 8, success, outsize: 29
+Hello World!
+unique: 10, opcode: FLUSH (25), nodeid: 2, insize: 64, pid: 12839
+   unique: 10, error: -38 (Function not implemented), outsize: 16
+unique: 12, opcode: RELEASE (18), nodeid: 2, insize: 64, pid: 0
+   unique: 12, success, outsize: 16
+$
+#+end_src
+
+It does! That's a wonderful first step.
+
+We can get back to the repl by either ~umount~'ing the mountpoint or sending
+~-HUP~ to our process.
+
+ 1)
+     #+begin_src shell
+ sudo umount /tmp/gfuse-test
+     #+end_src
+ 2)
+     #+begin_src shell
+ps -eo pid,args |grep 'try-main' | cut -f1 -d' '| head -1 | xargs kill -HUP
+     #+end_src
+
+ That's important as we now have a way to modify and kill/restart things. Yeah!
+
+ A little bit further before we ~fork()~ around.
+
+
+*** /File/ ~examples/hello.c~
+
+#+begin_src c :tangle ./examples/hello.c
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU GPLv2.
+  See the file COPYING.
+,*/
+
+/** @file
+ ,*
+ ,* minimal example filesystem using high-level API
+ ,*
+ ,* Compile with:
+ ,*
+ ,*     gcc -Wall hello.c `pkg-config fuse3 --cflags --libs` -o hello
+ ,*
+ ,* ## Source code ##
+ ,* \include hello.c
+ ,*/
+
+
+#define FUSE_USE_VERSION 31
+
+#include <fuse.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stddef.h>
+#include <assert.h>
+
+/*
+ ,* Command line options
+ ,*
+ ,* We can't set default values for the char* fields here because
+ ,* fuse_opt_parse would attempt to free() them when the user specifies
+ ,* different values on the command line.
+ ,*/
+static struct options {
+	const char *filename;
+	const char *contents;
+	int show_help;
+} options;
+
+#define OPTION(t, p)                           \
+    { t, offsetof(struct options, p), 1 }
+static const struct fuse_opt option_spec[] = {
+	OPTION("--name=%s", filename),
+	OPTION("--contents=%s", contents),
+	OPTION("-h", show_help),
+	OPTION("--help", show_help),
+	FUSE_OPT_END
+};
+
+static void *hello_init(struct fuse_conn_info *conn,
+			struct fuse_config *cfg)
+{
+	(void) conn;
+	cfg->kernel_cache = 1;
+	return NULL;
+}
+
+static int hello_getattr(const char *path, struct stat *stbuf,
+			 struct fuse_file_info *fi)
+{
+	(void) fi;
+	int res = 0;
+
+	memset(stbuf, 0, sizeof(struct stat));
+	if (strcmp(path, "/") == 0) {
+		stbuf->st_mode = S_IFDIR | 0755;
+		stbuf->st_nlink = 2;
+	} else if (strcmp(path+1, options.filename) == 0) {
+		stbuf->st_mode = S_IFREG | 0444;
+		stbuf->st_nlink = 1;
+		stbuf->st_size = strlen(options.contents);
+	} else
+		res = -ENOENT;
+
+	return res;
+}
+
+static int hello_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+			 off_t offset, struct fuse_file_info *fi,
+			 enum fuse_readdir_flags flags)
+{
+	(void) offset;
+	(void) fi;
+	(void) flags;
+
+	if (strcmp(path, "/") != 0)
+		return -ENOENT;
+
+	filler(buf, ".", NULL, 0, 0);
+	filler(buf, "..", NULL, 0, 0);
+	filler(buf, options.filename, NULL, 0, 0);
+
+	return 0;
+}
+
+static int hello_open(const char *path, struct fuse_file_info *fi)
+{
+	if (strcmp(path+1, options.filename) != 0)
+		return -ENOENT;
+
+	if ((fi->flags & O_ACCMODE) != O_RDONLY)
+		return -EACCES;
+
+	return 0;
+}
+
+static int hello_read(const char *path, char *buf, size_t size, off_t offset,
+		      struct fuse_file_info *fi)
+{
+	size_t len;
+	(void) fi;
+	if(strcmp(path+1, options.filename) != 0)
+		return -ENOENT;
+
+	len = strlen(options.contents);
+	if (offset < len) {
+		if (offset + size > len)
+			size = len - offset;
+		memcpy(buf, options.contents + offset, size);
+	} else
+		size = 0;
+
+	return size;
+}
+
+static const struct fuse_operations hello_oper = {
+	.init           = hello_init,
+	.getattr	= hello_getattr,
+	.readdir	= hello_readdir,
+	.open		= hello_open,
+	.read		= hello_read,
+};
+
+static void show_help(const char *progname)
+{
+	printf("usage: %s [options] <mountpoint>\n\n", progname);
+	printf("File-system specific options:\n"
+	       "    --name=<s>          Name of the \"hello\" file\n"
+	       "                        (default: \"hello\")\n"
+	       "    --contents=<s>      Contents \"hello\" file\n"
+	       "                        (default \"Hello, World!\\n\")\n"
+	       "\n");
+}
+
+int _main(int argc, char *argv[])
+{
+	int ret;
+	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+
+	/* Set defaults -- we have to use strdup so that
+	   fuse_opt_parse can free the defaults if other
+	   values are specified */
+	options.filename = strdup("hello");
+	options.contents = strdup("Hello World!\n");
+
+
+	/* Parse options */
+	if (fuse_opt_parse(&args, &options, option_spec, NULL) == -1) {
+		return 1;
+    }
+
+  fprintf(stderr, "hello: This is main! %s\n", argv[0]);
+	/* When --help is specified, first print our own file-system
+	   specific help text, then signal fuse_main to show
+	   additional help (by adding `--help` to the options again)
+	   without usage: line (by setting argv[0] to the empty
+	   string) */
+	if (options.show_help) {
+		show_help(argv[0]);
+		assert(fuse_opt_add_arg(&args, "--help") == 0);
+		args.argv[0][0] = '\0';
+	}
+
+	ret = fuse_main(args.argc, args.argv, &hello_oper, NULL);
+	fuse_opt_free_args(&args);
+	return ret;
+}
+
+
+int main(int argc, char *argv[]) { int ret = _main(argc, argv); return ret; }
+#+end_src
+
+
+** The ~c2ffi~ generator
+
+#+begin_src c :tangle gfuse.h
+#define FUSE_USE_VERSION 31
+
+#include <fuse.h>
+#+end_src
+
+#+begin_src shell :tangle ./bin/c2ffi-libfuse :shebang #!/usr/bin/env bash
+_file=${1:-"c2ffi-libfuse.ss"}
+_h=${1:-"gfuse.h"}
+
+echo '(export #t)' > $_file
+
+_cfile=`mktemp`
+_fusedir=$(pkg-config --cflags-only-I fuse3 | sed 's/^-I//g')
+
+echo "(def c2ffi-libfuse '(" >> $_file
+
+c2ffi -D sexp -i "$_fusedir" $_h >> $_file
+echo "))" >> $_file
+#+end_src
+
+#+RESULTS:
+
+* Gerbil lib
+
+#+begin_src gerbil :tangle gerbil.pkg
+(package: drewc/fuse)
+#+end_src
+
+#+begin_src gerbil :tangle build.ss :shebang #!/usr/bin/env gxi
+(import :std/build-script :std/make
+        :gerbil/gambit/ports)
+
+(def libs "fuse3")
+(def gerbil-path (getenv "GERBIL_PATH" "~/.gerbil"))
+(def libdir (path-expand "lib" gerbil-path))
+(def statdir (path-expand "static" libdir))
+
+(def (fgxc fn . rest)
+  (cons*
+   gxc: fn
+   "-cc-options"
+   (pkg-config-cflags libs)
+   "-ld-options"
+   (pkg-config-libs libs)
+   rest))
+
+(def (force-outputs) (force-output (current-error-port)) (force-output))
+(def (message . lst) (apply displayln lst) (force-outputs))
+
+(def (copy-compiled file)
+  (def libpath (path-expand (string-append "drewc/fuse/" file) libdir))
+  (create-directory* (path-directory libpath))
+  (message "... copy " file " to " libpath)
+
+  (when (file-exists? libpath)
+    (delete-file libpath))
+  (copy-file file libpath))
+
+(def (copy-static file)
+  (def spath (path-expand file statdir))
+  (def fpath (path-expand file (path-expand "static/" (path-directory (this-source-file)))))
+  (message "... copy static include " file)
+  (when (file-exists? spath)
+    (delete-file spath))
+  (copy-file fpath spath))
+
+(def (premade path)
+  (def posts
+    '("__0.o1"
+      "__rt.o1"
+      ".ssi"
+      ".ssxi.ss"))
+  (def files (map (cut string-append path <>) posts))
+
+  (map (cut copy-compiled <>) files))
+
+(def (make-clean)
+  (shell-command "find . -name '*__*.o*' -exec rm -v {} \\;")
+  (shell-command "find . -name '*.ssi' -exec rm -v {} \\;")
+  (shell-command "find . -name '*.ssxi.ss' -exec rm -v {} \\;")
+  (shell-command "find . -type d -name 'static' -exec rm -rv {} \\;"))
+
+(def (local-build)
+  (defbuild-script
+  `(; "c2ffi-libfuse"
+    ,(fgxc "examples/try-main-hello")
+    #;(gxc: "libfuse"
+    "-cc-options"
+    ,(pkg-config-cflags libs)
+    "-ld-options"
+    ,(pkg-config-libs libs)
+    )
+    )
+  verbose: 1
+  libdir: (path-directory (this-source-file)))
+  (main))
+
+(def (make-install)
+ (premade "examples/try-main-hello")
+ (for-each copy-static
+           (directory-files (path-expand "static/" (path-directory (this-source-file))))))
+
+
+(def (main . args)
+  (if (and (pair? args) (equal? (car args) "clean"))
+    (make-clean)
+    (begin
+      (make-clean)
+      (local-build)
+      (make-install))))
+
+#+end_src
+#+begin_src
+#+end_src

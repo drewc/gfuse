@@ -1,0 +1,299 @@
+#+TITLE: Getting Started with FFI
+
+This is a quick guide to help you with your first FFI steps with Gerbil.
+
+The first thing to note is that FFI in Gerbil is actually delegated to Gambit,
+where the mechanism to interface with C is known as the C-interface. See the
+[[file:gambit.org::*16. C-interface][Gambit Manual]] for more information.
+
+The primary mechanism for delegating code directly to gambit is the
+=begin-foreign= special form:
+
+#+begin_example
+  (begin-foreign body ...)
+#+end_example
+
+Using the form, the =body= is included unexpanded directly to the
+generated gambit code for compilation with gsc.
+
+* Basic FFI
+:PROPERTIES:
+:CUSTOM_ID: basic-ffi
+:END:
+We'll start our foray with a basic example: we are going to query for
+the version of glibc on the current machine. The C code that achieves
+this:
+
+#+begin_src C
+#include <stdio.h>
+#include <gnu/libc-version.h>
+int main (void) { puts (gnu_get_libc_version ()); return 0; }
+#+end_src
+
+We need to write a file module that will define and export an identifier
+get-glibc-version. Subsequently, we'll import that identifier and use it
+in the Gerbil runtime.
+
+#+begin_example
+  # Create a gerbil.pkg file for our project
+  $ cat > gerbil.pkg <<EOF
+  (package: myuser)
+  EOF
+  $ cat > libc-version.ss <<EOF
+  (export get-glibc-version)
+  (extern get-glibc-version)
+  (begin-foreign
+    (namespace ("myuser/libc-version#" get-glibc-version))
+    (c-declare "#include  <gnu/libc-version.h>")
+    (define get-glibc-version (c-lambda () char-string "gnu_get_libc_version")))
+  EOF
+#+end_example
+
+File modules take their name from the including file, so this module is
+named libc-version in the myuser package and as a result uses
+=myuser/libc-version#= as the namespace prefix.
+
+To feed code straight to the Gambit compiler from Gerbil we use the
+=begin-foreign= special form. We namespace the identifier with the
+package and module to adhere to the canonical namespace of the module.
+
+We compile the module.
+
+#+begin_src shell
+$ gxc libc-version.ss
+#+end_src
+
+We're now ready to use the module.
+
+#+begin_src shell
+$ gxi
+> (import :myuser/libc-version)
+> (get-glibc-version)
+"2.26"
+#+end_src
+
+Did you notice the compilation warning?
+
+#+begin_example
+  /usr/local/Gambit/v4.8.9/include/gambit.h:7262:32: warning: assignment discards ‘const’ qualifier from pointer target type [-Wdiscarded-qualifiers]
+   #define ___CFUN_ASSIGN(r,val)r = val;
+                                  ^
+  libc-version__0.c:179:1: note: in expansion of macro ‘___CFUN_ASSIGN’
+   ___CFUN_ASSIGN(___result,gnu_get_libc_version())
+   ^~~~~~~~~~~~~~
+#+end_example
+
+That is because gsc doesn't have a const qualifier. We can work around
+it by replacing the original call with an equivalent call that performs
+explicit casting.
+
+#+begin_example
+  (define get-glibc-version (c-lambda () char-string "___return((char*)gnu_get_libc_version());"))
+#+end_example
+
+Et voilà, no more compilation warning!
+
+* The begin-ffi macro
+:PROPERTIES:
+:CUSTOM_ID: the-begin-ffi-macro
+:END:
+In order to simplify writing ffi code, Gerbil offers the =begin-ffi=
+macro in the =:std/foreign= library.
+
+The macro takes care of providing the extern and namespace declarations
+for your identifiers.
+
+It also defines some common utility macros:
+ - =(define-c-lambda id args ret [name/code])= which expands to the definition
+   of a c-lambda.
+ - =(define-const id)= which expands to a definition that evals the constant
+   in C.
+ - =(define-const* id)= which conditionally defines the constant to a value of
+   =#f= if it is undefined in the C preprocessor.
+ - =(define-guard defn)= which conditionally expands a definition with an accompanied cond-expand feature.
+ - =(define-with-errno id ffi-id args)= which expands to a definition of =(id
+   args ...)= which calls =(ffi-id args ...)= and returns the negated errno if
+   the result is negative. This is useful for wrapping C/POSIX ffi functions
+   that report errors using =errno=.
+
+
+In addition, it provides a few other preprocessor macros and a
+definition of =ffi_free=, a function suitable as a release function for
+ffi types.
+
+Using =begin-ffi= the code would be written as following:
+
+#+begin_example
+  (export get-glibc-version)
+  (begin-ffi (get-glibc-version)
+    (c-declare "#include  <gnu/libc-version.h>")
+    (define-c-lambda get-glibc-version () char-string "gnu_get_libc_version"))
+#+end_example
+
+If you want to find more about Gerbil FFI programming, the std lib sources for
+the [[https://github.com/vyzo/gerbil/tree/master/src/std/os][os package]] are a good starting point.
+
+* Interfacing with c structs
+:PROPERTIES:
+:CUSTOM_ID: interfacing-with-c-structs
+:END:
+In order to make interfacing with c structs a bit easier, some macros
+are provided to be used inside the begin-ffi block.
+
+Consider a c struct X with members a of type t1 and b of type t2.\\
+In order to interface with such a struct, following methods are
+available inside the begin-ffi macro.
+
+** =(define-c-struct X)=
+:PROPERTIES:
+:CUSTOM_ID: define-c-struct-x
+:END:
+/types created/ - X for struct - X* for the pointer to the struct. this
+is the struct to which the configurable release function is provided. If
+no release function is provided and struct contains string members, then
+a c method (=<struct-name>_ffi_free=) is generated for the struct, which
+performs the cleanup of strings as well as the pointers. If there are no
+string members, we fallback to the default ffi_free. - X-shallow-ptr*
+similar to X/, default release function ffi_free is associated (this is
+only created if char-string is one of the members) - X-borrowed-ptr/
+similat to X* but no release function
+
+/lambdas created/ - =X-ptr?= predicate for the struct types (uses
+foreign-tags) - =malloc-X= calls malloc for the struct and returns a
+pointer to it - =ptr->X= get the value of X from its pointer -
+=(malloc-X-array N)= calls malloc for N * sizeof X and returns a pointer
+to it, the returned pointer is of type X-shallow-ptr* if strings are
+present otherwise it is X/ - =(X-array-ref ptr i)= returns a pointer
+with offset i starting at ptr, the returned pointer is of type
+X-borrowed-ptr/ - =(X-array-set! ptr i val-ptr)= sets the value of the
+pointer at offset i from ptr to be val-ptr
+
+** =(define-c-struct X ((a . t1) (b . t2)))=
+:PROPERTIES:
+:CUSTOM_ID: define-c-struct-x-a-.-t1-b-.-t2
+:END:
+In addition to the types and lambdas defined above, following additional
+lambdas are provided:
+
+/lambdas created/ - =X-a-set!=, =X-b-set!= setters for member
+variables.\\
+Special compatibility for string types is provided,\\
+If a string is passed as the value, then we strdup the string and set
+that to the argument. If the struct member is already pointing to
+another string, then that string is freed and the member will now point
+to a new string. The cleanup of such strings are handled by the
+generated =<struct-name>_ffi_free=, if a custom release function is
+provided, care should be taken while freeing.
+
+- =X-a=, =X-b= accessor functions for struct members
+
+In order to export the created lamdas, simply include (struct X a b) in
+the begin-ffi: =(begin-ffi (... (struct X a b) ...) ...)=
+
+** Sample usage:
+:PROPERTIES:
+:CUSTOM_ID: sample-usage
+:END:
+#+begin_example
+  (begin-ffi ((struct abc a b))
+    (c-declare "
+  struct abc {
+      char* a;
+      char* b;
+      char* c;
+  };
+  ")
+    
+
+    (define-c-struct abc ((a . char-string) (b . char-string)))) ;; don't need to define all fields
+    
+  (def obj (malloc-abc))
+               
+  (abc-a-set! obj "hello")
+  (abc-b-set! obj "scheme")
+
+  (abc-a obj) ;; => hello
+#+end_example
+
+* Interfacing with a custom C program
+:PROPERTIES:
+:CUSTOM_ID: interfacing-with-a-custom-c-program
+:END:
+This example shows how to compile and link a C module to a Gerbil
+module, in order to call functions and return constants from the former.
+
+Consider there are a simple module written in C defining two functions,
+f1 and f2:
+
+#+begin_example
+  $ cat ffi-pi.h
+  #ifndef _ffi_pi_h
+  #define _ffi_pi_h
+  double f1(void); 
+  double f2(double x);
+  #endif
+
+  $ cat ffi-pi.c
+  #include <stdlib.h>
+  #include <math.h>
+  #include "ffi-pi.h"
+
+  double f1(void) {
+    return M_PI;
+  }
+
+  double f2(double x) {
+    return asin(x) - asin(-x);
+  }
+#+end_example
+
+Compiling ffi-pi.c:
+
+#+begin_example
+  $ gcc -Wall -c ffi-pi.c
+#+end_example
+
+Now, the Gerbil code:
+
+#+begin_example
+  $ cat ffi-pi.ss
+  package: ffi-example
+
+  (import :std/foreign
+          :std/format
+          :std/iter)
+
+  (export #t)
+
+  (begin-ffi (M_PI f1 f2)
+    (c-declare "#include <math.h>")
+    (c-declare "#include \"ffi-pi.h\"")
+    (define M_PI ((c-lambda () double "___return(M_PI);")))
+    (define pi (c-lambda () double "___return(M_PI);"))
+    (define-c-lambda f1 () double "f1")
+    (define-c-lambda f2 (double) double "f2")
+    )
+#+end_example
+
+Note that there are two definitions for number pi: the first, M_PI is a
+constant and the second is a function.
+
+Compile that with:
+
+#+begin_example
+  gxc -ld-options `pwd`/ffi-pi.o -cc-options -I`pwd` ffi-pi.ss
+#+end_example
+
+And use the module:
+
+#+begin_example
+  $ gxi
+  Gerbil v0.16-133-gfdfdcb5d on Gambit v4.9.3-1232-gbba388b8
+  > (import :ffi-example/ffi-pi)
+  > (= M_PI (pi))
+  #t
+  > (= M_PI (f1))
+  #t
+  > (= (f1) (f2 1.0))
+  #t
+#+end_example

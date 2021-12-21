@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+_file=${1:-"c2ffi-libfuse.ss"}
+_h=${1:-"gfuse.h"}
+
+echo '(export #t)' > $_file
+
+_cfile=`mktemp`
+_fusedir=$(pkg-config --cflags-only-I fuse3 | sed 's/^-I//g')
+
+echo "(def c2ffi-libfuse '(" >> $_file
+
+c2ffi -D sexp -i "$_fusedir" $_h >> $_file
+echo "))" >> $_file
