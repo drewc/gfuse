@@ -36,7 +36,7 @@ mkdir -p /tmp/gfuse-fest
 
 Here's the ~./examples/try-main-hello.ss~.
 
-#+begin_src scheme :tangle ./examples/try-main-hello.ss :mkdirp t
+#+begin_src scheme :tangle ./examples/try-main-hello.ss
 (export try-main)
 (import :std/foreign :gerbil/gambit/foreign :gerbil/gambit/threads)
 
@@ -141,6 +141,267 @@ ps -eo pid,args |grep 'try-main' | cut -f1 -d' '| head -1 | xargs kill -HUP
 
  A little bit further before we ~fork()~ around.
 
+*** ~first-hello~ Executable
+
+This is quite simple. Essentially we need to prepare, on gerbil's side, the
+variables ~argc~ and ~argv~ from a ~(main . args)~ function.
+
+The only reason it's simple is this part comes after the figuring out of how to
+do just that. The details are in the first [[#firstHelloExec][~opt.ss~ and ~fuse_opt.h~]] that
+follows.
+
+#+begin_src scheme :tangle ./examples/first-hello.ss :noweb yes
+(export (import: ../opt) main)
+(import :std/foreign :gerbil/gambit/foreign ../opt)
+
+(def (main . args) (%main (fuse_args<-list ["first-hello" args ...])))
+(begin-ffi (%main fuse_args*)
+  (c-declare "#include \"hello.c\"")
+  (c-declare "#include <fuse_opt.h>")
+  (define-c-struct fuse_args)
+  (define-c-lambda %main (fuse_args*) int "
+int res = _main(___arg1->argc, ___arg1->argv);
+___return(res);"))
+#+end_src
+
+That creates a binary that, when dynmaically loading gerbil/gambit objects,
+works great!
+
+#+begin_src shell
+$ sudo GERBIL_PATH=$HOME/.gerbil ./bin/first-hello \
+         --name="hello-gerbil" --contents=$'Gerbil Noise!\n' -o allow_other /tmp/gfuse-test
+hello: This is main! first-hello
+$ ls /tmp/gfuse-test/
+hello-gerbil
+$ cat /tmp/gfuse-test/hello-gerbil
+Gerbil Noise!
+$ sudo umount /tmp/gfuse-test
+$ ls /tmp/gfuse-test/
+$
+#+end_src
+
+
+**** ~opt.ss~ and ~fuse_opt.h~
+:PROPERTIES:
+:CUSTOM_ID: firstHelloExec
+:END:
+
+
+This time we need some C fsckery. We need to create our own ~argc~ and ~argv~ to
+pass to main.
+
+The "easy" way is to use what FUSE provides and build on that.
+
+We'll make an FFI struct!
+
+
+#+begin_quote
+#include <fuse_opt.h>
+
+Data Fields
+  int 	argc
+  char ** 	argv
+  int 	allocated
+#+end_quote
+
+In gerbil. The free function is in ~_main()~ as well so there you go.
+
+#+begin_src scheme :noweb-ref fuse_args
+(c-declare "___SCMOBJ fuse_opt_ffi_free_args (void *ptr) {
+     fuse_opt_free_args(ptr);
+     return ___FIX (___NO_ERR);
+    };
+")
+
+(define-c-struct fuse_args
+  ((argc . int)
+   (argv . (pointer char-string))
+   (allocated . int))
+  "fuse_opt_ffi_free_args")
+;;(c-define-type fuse_args (struct "fuse_args"))
+;;(c-define-type fuse_args* (pointer fuse_args))
+#+end_src
+
+At the bottom of the ~hello.c~ file there's an init. We'l crib that and malloc
+on the heap. We need at least one in the ~argv~ which makes sense if you know
+*POSIX*.
+
+
+#+begin_src c :noweb-ref emulate argv
+char *argv[] = {
+   ___arg1,
+   NULL
+};
+#+end_src
+
+Make it heapy.
+
+#+begin_src c :noweb-ref struct args
+struct fuse_args stack_args = FUSE_ARGS_INIT(1, argv);
+struct fuse_args *heap_args;
+heap_args = (struct fuse_args *) malloc(sizeof(struct fuse_args));
+,*heap_args = stack_args;
+
+#+end_src
+
+And create an init function that does just that.
+
+#+begin_src scheme :noweb yes :noweb-ref fuse_args_init
+(define-c-lambda %FUSE_ARGS_INIT (char-string) fuse_args* #<<EOF
+  <<emulate argv>>
+  <<struct args>>
+
+	/* This seems to be what is needed to init and allocate. */
+	if (fuse_opt_parse(heap_args, NULL, NULL, NULL) == -1) {
+		___return(NULL);   };
+  ___return(heap_args);
+EOF
+)
+#+end_src
+
+How about some ~fuse_arg-ref~'s?
+
+#+begin_src scheme :noweb-ref %fuse_args-ref
+(define-c-lambda %fuse_args-ref (fuse_args* int) char-string
+  "char* ret = ___arg1->argv[___arg2];
+___return(ret);")
+#+end_src
+
+#+begin_src scheme :noweb-ref fuse_args-ref
+(def (fuse_args-ref fas n)
+  (let (limit (fuse_args-argc fas))
+    (and (> limit n) (%fuse_args-ref fas n))))
+
+#+end_src
+
+There are now two functions we should FFI with.
+
+First there's ~fuse_opt_insert_arg~ which we'll turn into ~fuse_args-ref-set!~.
+
+#+begin_src scheme :noweb-ref fuse_args-ref
+(def (fuse_args-ref-set! fas n v)
+  (let (limit (fuse_args-argc fas))
+    (if (> n limit) (error "arg index Out of range: ~a >= ~a "
+                       n limit)
+        (fuse_opt_insert_arg fas n v))))
+#+end_src
+
+#+begin_src scheme :noweb-ref fuse_opt_insert_arg
+(define-c-lambda fuse_opt_insert_arg (fuse_args* int char-string) int
+  "fuse_opt_insert_arg")
+#+end_src
+
+There's also ~fuse_opt_add_arg~ which we don't actually require as ~fuse_opt_insert_arg~ calls it but it does make it clear.
+
+#+begin_src scheme :noweb-ref fuse_opt_add_arg
+(define-c-lambda fuse_opt_add_arg (fuse_args* char-string) int
+  "fuse_opt_add_arg")
+#+end_src
+
+Using them we can make a ~fuse_args<-list~ constructor. Aliased as ~list->fuse_args~ for those forwards people.
+
+#+begin_src scheme :noweb-ref fuse_args<-list
+(def (fuse_args<-list lst)
+  (def fas (%FUSE_ARGS_INIT (car lst)))
+  (def n 1)
+  (for-each (lambda (fa)
+              (set! (fuse_args-ref fas n) fa)
+              (set! n (1+ n)))
+            (cdr lst))
+  fas)
+(defalias list->fuse_args fuse_args<-list)
+#+end_src
+
+Now just to confuse those forwards thinkers that think end is the result, ~list<-fuse_args~ and ~fuse_args->list~.
+
+#+begin_src scheme :noweb-ref fuse_args->list
+(def (fuse_args->list fas)
+  (def limit (fuse_args-argc fas))
+  (let lst ((n 0))
+    (if (= n limit) []
+        (cons (fuse_args-ref fas n) (lst (1+ n))))))
+(defalias list<-fuse_args fuse_args->list)
+#+end_src
+
+It's important to note that our ~set!~ does not modify but rather appends or
+prepends at ~pos~.
+
+#+begin_quote
+◆ fuse_opt_insert_arg()
+
+int fuse_opt_insert_arg	(
+  struct fuse_args * 	args,
+  int 	pos,
+  const char * 	arg
+)
+
+Add an argument at the specified position in a NULL terminated argument vector
+
+Adds the argument to the N-th position. This is useful for adding options at the
+beginning of the array which must not come after the special '–' option.
+
+Parameters
+  - args	is the structure containing the current argument list
+  - pos	is the position at which to add the argument
+  - arg	is the new argument to add
+Returns
+-1 on allocation error, 0 on success
+#+end_quote
+
+Keeping that in mind it works.
+
+#+begin_src scheme
+> (def args ["car" "-d" "-o" "allow_other" "/tmp/gfuse-test"])
+> (def fas (fuse_args<-list args))
+> (list<-fuse_args fas)
+("car" "-d" "-o" "allow_other" "/tmp/gfuse-test")
+#+end_src
+
+***** /File/ ~opt.ss~
+
+All of those things can be placed in a file that will grow to have most of ~fuse_opt.h~ translated.
+
+#+begin_src scheme :tangle ./opt.ss :noweb yes
+(export
+  %FUSE_ARGS_INIT
+  fuse_args
+  fuse_args*
+  fuse_args-argc
+  fuse_args-argv
+  fuse_args-allocated
+  fuse_args-ref
+  fuse_args-ref-set!
+  fuse_opt_insert_arg
+  fuse_opt_add_arg
+  fuse_args<-list list->fuse_args
+  fuse_args->list list<-fuse_args)
+(import :std/foreign :gerbil/gambit/foreign)
+
+<<fuse_args-ref>>
+
+<<fuse_args->list>>
+
+<<fuse_args<-list>>
+
+(begin-ffi
+    (%FUSE_ARGS_INIT
+     fuse_opt_add_arg
+     %fuse_args-ref
+     fuse_opt_insert_arg
+     fuse_args fuse_args* (struct fuse_args argc argv allocated)
+     )
+  (c-declare "#include <fuse_opt.h>")
+
+  <<fuse_args>>
+
+<<fuse_args_init>>
+
+  <<fuse_opt_insert_arg>>
+
+  <<%fuse_args-ref>>)
+
+#+end_src
+
 
 *** /File/ ~examples/hello.c~
 
@@ -203,7 +464,7 @@ static void *hello_init(struct fuse_conn_info *conn,
 			struct fuse_config *cfg)
 {
 	(void) conn;
-	cfg->kernel_cache = 1;
+cfg->kernel_cache = 1;
 	return NULL;
 }
 
@@ -371,6 +632,7 @@ echo "))" >> $_file
 (def libs "fuse3")
 (def gerbil-path (getenv "GERBIL_PATH" "~/.gerbil"))
 (def libdir (path-expand "lib" gerbil-path))
+(def bindir (path-expand "bin" gerbil-path))
 (def statdir (path-expand "static" libdir))
 
 (def (fgxc fn . rest)
@@ -421,7 +683,10 @@ echo "))" >> $_file
 (def (local-build)
   (defbuild-script
   `(; "c2ffi-libfuse"
+    ,(fgxc "opt")
     ,(fgxc "examples/try-main-hello")
+    ,(fgxc "examples/first-hello")
+    ;,(fgxc "examples/first-hello-exe")
     #;(gxc: "libfuse"
     "-cc-options"
     ,(pkg-config-cflags libs)
@@ -433,8 +698,19 @@ echo "))" >> $_file
   libdir: (path-directory (this-source-file)))
   (main))
 
+(def (build-exes)
+  (defbuild-script
+    `((exe: ,@(cdr (fgxc "examples/first-hello"))))
+    verbose: 1
+    libdir: (path-directory (this-source-file))
+    bindir: (path-expand "bin/" (path-directory (this-source-file))))
+  (main))
+
 (def (make-install)
+ (premade "opt")
  (premade "examples/try-main-hello")
+ (premade "examples/first-hello")
+; (premade "examples/first-hello-exe")
  (for-each copy-static
            (directory-files (path-expand "static/" (path-directory (this-source-file))))))
 
@@ -445,7 +721,10 @@ echo "))" >> $_file
     (begin
       (make-clean)
       (local-build)
-      (make-install))))
+      (make-install)
+      (build-exes)
+      (make-install)
+      )))
 
 #+end_src
 #+begin_src

@@ -5,6 +5,7 @@
 (def libs "fuse3")
 (def gerbil-path (getenv "GERBIL_PATH" "~/.gerbil"))
 (def libdir (path-expand "lib" gerbil-path))
+(def bindir (path-expand "bin" gerbil-path))
 (def statdir (path-expand "static" libdir))
 
 (def (fgxc fn . rest)
@@ -55,7 +56,10 @@
 (def (local-build)
   (defbuild-script
   `(; "c2ffi-libfuse"
+    ,(fgxc "opt")
     ,(fgxc "examples/try-main-hello")
+    ,(fgxc "examples/first-hello")
+    ;,(fgxc "examples/first-hello-exe")
     #;(gxc: "libfuse"
     "-cc-options"
     ,(pkg-config-cflags libs)
@@ -67,8 +71,19 @@
   libdir: (path-directory (this-source-file)))
   (main))
 
+(def (build-exes)
+  (defbuild-script
+    `((exe: ,@(cdr (fgxc "examples/first-hello"))))
+    verbose: 1
+    libdir: (path-directory (this-source-file))
+    bindir: (path-expand "bin/" (path-directory (this-source-file))))
+  (main))
+
 (def (make-install)
+ (premade "opt")
  (premade "examples/try-main-hello")
+ (premade "examples/first-hello")
+; (premade "examples/first-hello-exe")
  (for-each copy-static
            (directory-files (path-expand "static/" (path-directory (this-source-file))))))
 
@@ -79,4 +94,7 @@
     (begin
       (make-clean)
       (local-build)
-      (make-install))))
+      (make-install)
+      (build-exes)
+      (make-install)
+      )))
