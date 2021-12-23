@@ -55,25 +55,28 @@
 
 (def (local-build)
   (defbuild-script
-  `(; "c2ffi-libfuse"
-    ,(fgxc "opt")
-    ,(fgxc "examples/try-main-hello")
-    ,(fgxc "examples/first-hello")
-    ;,(fgxc "examples/first-hello-exe")
-    #;(gxc: "libfuse"
-    "-cc-options"
-    ,(pkg-config-cflags libs)
-    "-ld-options"
-    ,(pkg-config-libs libs)
-    )
-    )
-  verbose: 1
-  libdir: (path-directory (this-source-file)))
+    `(                                  ; "c2ffi-libfuse"
+      ,(fgxc "opt")
+      ,(fgxc "examples/try-main-hello")
+      ,(fgxc "examples/first-hello")
+      ,(fgxc "examples/second-hello")
+                                        ;,(fgxc "examples/first-hello-exe")
+      #;(gxc: "libfuse"
+      "-cc-options"                     ;
+      ,(pkg-config-cflags libs)         ;
+      "-ld-options"                     ;
+      ,(pkg-config-libs libs)           ;
+      )
+      )
+    verbose: 1
+    libdir: (path-directory (this-source-file)))
+
   (main))
 
 (def (build-exes)
   (defbuild-script
-    `((exe: ,@(cdr (fgxc "examples/first-hello"))))
+    `((exe: ,@(cdr (fgxc "examples/first-hello")))
+      (static-exe: ,@(cdr (fgxc "examples/second-hello"))))
     verbose: 1
     libdir: (path-directory (this-source-file))
     bindir: (path-expand "bin/" (path-directory (this-source-file))))
@@ -83,7 +86,7 @@
  (premade "opt")
  (premade "examples/try-main-hello")
  (premade "examples/first-hello")
-; (premade "examples/first-hello-exe")
+ (premade "examples/second-hello")
  (for-each copy-static
            (directory-files (path-expand "static/" (path-directory (this-source-file))))))
 
@@ -96,5 +99,4 @@
       (local-build)
       (make-install)
       (build-exes)
-      (make-install)
-      )))
+      (make-install))))
