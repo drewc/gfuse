@@ -60,6 +60,7 @@
       ,(fgxc "examples/try-main-hello")
       ,(fgxc "examples/first-hello")
       ,(fgxc "examples/second-hello")
+      ,(fgxc "examples/gfuse-read-hello")
                                         ;,(fgxc "examples/first-hello-exe")
       #;(gxc: "libfuse"
       "-cc-options"                     ;
@@ -76,7 +77,9 @@
 (def (build-exes)
   (defbuild-script
     `((exe: ,@(cdr (fgxc "examples/first-hello")))
-      (static-exe: ,@(cdr (fgxc "examples/second-hello"))))
+      (static-exe: ,@(cdr (fgxc "examples/second-hello")))
+      ;;(static-exe: ,@(cdr (fgxc "examples/gfuse-read-hello")))
+      )
     verbose: 1
     libdir: (path-directory (this-source-file))
     bindir: (path-expand "bin/" (path-directory (this-source-file))))
@@ -87,6 +90,7 @@
  (premade "examples/try-main-hello")
  (premade "examples/first-hello")
  (premade "examples/second-hello")
+ (premade "examples/gfuse-read-hello")
  (for-each copy-static
            (directory-files (path-expand "static/" (path-directory (this-source-file))))))
 

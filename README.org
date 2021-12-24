@@ -403,7 +403,9 @@ All of those things can be placed in a file that will grow to have most of ~fuse
 #+end_src
 
 
-*** What about ASAP? AKA As Static As Possible
+*** What about ASAP?
+
+*AKA: As Static As Possible*
 
 My dream is to ship a single binary that runs on most any linux x86-64. I think
 I can get us there but it's a path full of fun as we do not yet design around
@@ -459,6 +461,398 @@ need another. Beyond that it's still [[#binHelloC][~/hello.c~]].
   (define-c-lambda %main (fuse_args*) int "
 int res = _main(___arg1->argc, ___arg1->argv);
 ___return(res);"))
+#+end_src
+
+It works!
+
+#+begin_src shell
+$ sudo ./bin/second-hello \
+    --name="hello-gerbil" --contents=$'Gerbil Noise!\n'\
+    -o allow_other /tmp/gfuse-test
+$ cat /tmp/gfuse-test/hello-gerbil
+Gerbil Noise!
+$ sudo umount /tmp/gfuse-test
+$ cat /tmp/gfuse-test/hello-gerbil
+cat: /tmp/gfuse-test/hello-gerbil: No such file or directory
+#+end_src
+
+*** ~gfuse_read~: part 1.
+
+Right now we just pass strings to *C* and it takes care of the rest.
+
+That's not what I desire. Gerbil must feed things!
+
+We'll make it so. First, What does ~hello_read()~ do?.
+
+#+begin_src c
+static int hello_read(const char *path, char *buf, size_t size, off_t offset,
+		      struct fuse_file_info *fi)
+{
+	size_t len;
+	(void) fi;
+	if(strcmp(path+1, options.filename) != 0)
+		return -ENOENT;
+
+	len = strlen(options.contents);
+	if (offset < len) {
+		if (offset + size > len)
+			size = len - offset;
+		memcpy(buf, options.contents + offset, size);
+	} else
+		size = 0;
+
+	return size;
+}
+#+end_src
+
+We'll try and make it simple. No strings but rather ~u8vector~'s, AKA ~bytes~.
+
+All we want to do is copy a vector of bytes to the ~char* buf~. Easy, right?
+
+First attempt, The *C* function calls a *Scheme* function which calls a *C* lambda function.
+
+So first the *C* function.
+
+#+begin_src c :noweb-ref first-hello-read
+static int hello_read(const char *path, char *buf, size_t size, off_t offset,
+		      struct fuse_file_info *fi)
+{
+  int ret = gfuse_read(path, buf, size, offset, fi);
+  return ret;
+
+};
+#+end_src
+
+We'll make it come from a "global" in *Gerbil*.
+
+#+begin_src scheme :noweb-ref first-contents
+(define file-contents (string->bytes "This is a byte sized string!\n"))
+#+end_src
+
+Now the *Scheme* function. This uses [[file:doc/gambit.org::#the-c-define-special-form][The =c-define= special form]].
+
+#+begin_src scheme :noweb-ref gfuse-read
+(define-c-struct fuse_file_info)
+(c-define
+ (gfuse-read path buf size offset fi)
+ (char-string (pointer char) size_t int fuse_file_info*)
+ int "gfuse_read" "static"
+
+ (gfuse-read-bytes file-contents path buf size offset fi))
+#+end_src
+
+And finally the link back to *C*.
+
+#+begin_src scheme :noweb-ref hello-gfuse-read-bytes
+(define-c-lambda gfuse-read-bytes
+  (scheme-object char-string (pointer char) size_t int fuse_file_info*)
+  int
+  "
+  ___SCMOBJ bytes = ___arg1;
+  char *path= ___arg2;
+  char *buf = ___arg3;
+	size_t len;
+  size_t size = ___arg4;
+  int offset = ___arg5;
+
+  (void) ___arg6;
+
+	if(strcmp(path+1, options.filename) != 0)
+		___return(-ENOENT);
+
+	len = U8_LEN (bytes);
+
+  fprintf(stderr, \"gfuse: This is gerbil read! %d %d %d \\n\", len, offset, size);
+	if (offset < len) {
+		if (offset + size > len)
+			size = len - offset;
+		memcpy(buf, U8_DATA (bytes) + offset, size);
+	} else
+		size = 0;
+
+	___return(size);
+    ")
+#+end_src
+
+Trying it like this it sort of works but cuts short.
+
+#+begin_src shell
+$ sudo GERBIL_PATH=~drewc/.gerbil gxi \
+    -e "(begin (import :drewc/fuse/examples/gfuse-read-hello))" \
+    -e '(main "-o" "allow_other" "/tmp/gfuse-test")
+$  cat /tmp/gfuse-test/hello
+This is a byt$
+#+end_src
+
+The reason why is actually simple. I jumped ahead, and before ~hello_read~ is in fact ~hello_getattr~ which returns the length as ~strlen(options.contents)~ which is not right.
+
+#+begin_src c
+static int hello_getattr(const char *path, struct stat *stbuf,
+			 struct fuse_file_info *fi)
+{
+	(void) fi;
+	int res = 0;
+
+	memset(stbuf, 0, sizeof(struct stat));
+	if (strcmp(path, "/") == 0) {
+		stbuf->st_mode = S_IFDIR | 0755;
+		stbuf->st_nlink = 2;
+	} else if (strcmp(path+1, options.filename) == 0) {
+		stbuf->st_mode = S_IFREG | 0444;
+		stbuf->st_nlink = 1;
+		stbuf->st_size = strlen(options.contents);
+	} else
+		res = -ENOENT;
+
+	return res;
+}
+#+end_src
+
+We can simple return the length of our vector.
+
+#+begin_src scheme :noweb-ref hello-gfuse-file-size
+(c-define
+ (gfuse-file-size) ()
+ int "gfuse_file_size" ""
+ (u8vector-length file-contents))
+#+end_src
+
+... and repeat with that.
+
+
+#+begin_src c :noweb-ref gfuse-read-getattr
+static int hello_getattr(const char *path, struct stat *stbuf,
+			 struct fuse_file_info *fi)
+{
+	(void) fi;
+	int res = 0;
+
+	memset(stbuf, 0, sizeof(struct stat));
+	if (strcmp(path, "/") == 0) {
+		stbuf->st_mode = S_IFDIR | 0755;
+		stbuf->st_nlink = 2;
+	} else if (strcmp(path+1, options.filename) == 0) {
+		stbuf->st_mode = S_IFREG | 0444;
+		stbuf->st_nlink = 1;
+		stbuf->st_size = gfuse_file_size();
+	} else
+		res = -ENOENT;
+
+	return res;
+}
+#+end_src
+
+Does it work?
+
+#+begin_src shell
+$ sudo GERBIL_PATH=~drewc/.gerbil gxi \
+    -e "(begin (import :drewc/fuse/examples/gfuse-read-hello))" \
+    -e '(main "-o" "allow_other" "/tmp/gfuse-test")'
+$ cat /tmp/gfuse-test/hello
+This is a byte sized string!
+$
+#+end_src
+
+Yes! How about a static build? Nope. Fails again on the *C* part.
+
+#+begin_src shell
+gfuse-read-hello.c: In function ‘gfuse_read’:
+gfuse-read-hello.c:651:23: error: ‘___C_LBL_gfuse_read’ undeclared (first use in this function)
+  651 | ___BEGIN_SFUN(___MLBL(___C_LBL_gfuse_read),int ___result)
+      |                       ^~~~~~~~~~~~~~~~~~~
+#+end_src
+
+Still, works enough to move onto the next step which may be the static build
+again.
+
+
+
+#+begin_src scheme :tangle ./examples/gfuse-read-hello.ss :noweb yes
+(export (import: ../opt) main)
+(import :std/foreign :gerbil/gambit/foreign ../opt :gerbil/gambit)
+
+(def (main . args)
+  (%main (fuse_args<-list
+          [(car ##processed-command-line) args ...])))
+
+(begin-ffi (%main fuse_args*)
+  (namespace ("drewc/fuse/examples/first-read-hello#"
+              file-contents))
+  (c-declare "#define FUSE_USE_VERSION 31")
+  (c-declare "#include <fuse.h>")
+  (c-declare "#include <fuse_opt.h>")
+  (c-declare "static int gfuse_read(char *, char *, long unsigned int,  int,  struct fuse_file_info *);")
+  <<hello-gfuse-file-size>>
+  (c-declare "#include \"gfuse_read-hello.c\"")
+
+  <<first-contents>>
+  <<extern-c-struct>>
+  <<gfuse-read>>
+  <<hello-gfuse-read-bytes>>
+  (extern-c-struct fuse_args)
+  (define-c-lambda %main (fuse_args*) int "
+int res = _main(___arg1->argc, ___arg1->argv);
+___return(res);"))
+
+
+#+end_src
+
+
+
+
+*** /File/ ~examples/fuse_read-hello.c~
+:PROPERTIES:
+:CUSTOM_ID: exFuseReadHello
+:END:
+
+#+begin_src c :tangle ./examples/gfuse_read-hello.c :noweb yes
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU GPLv2.
+  See the file COPYING.
+,*/
+
+/** @file
+ ,*
+ ,* minimal example filesystem using high-level API
+ ,*
+ ,* Compile with:
+ ,*
+ ,*     gcc -Wall hello.c `pkg-config fuse3 --cflags --libs` -o hello
+ ,*
+ ,* ## Source code ##
+ ,* \include hello.c
+ ,*/
+
+
+#define FUSE_USE_VERSION 31
+
+#include <fuse.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stddef.h>
+#include <assert.h>
+
+/*
+ ,* Command line options
+ ,*
+ ,* We can't set default values for the char* fields here because
+ ,* fuse_opt_parse would attempt to free() them when the user specifies
+ ,* different values on the command line.
+ ,*/
+static struct options {
+	const char *filename;
+	const char *contents;
+	int show_help;
+} options;
+
+#define OPTION(t, p)                           \
+    { t, offsetof(struct options, p), 1 }
+static const struct fuse_opt option_spec[] = {
+	OPTION("--name=%s", filename),
+	OPTION("--contents=%s", contents),
+	OPTION("-h", show_help),
+	OPTION("--help", show_help),
+	FUSE_OPT_END
+};
+
+static void *hello_init(struct fuse_conn_info *conn,
+			struct fuse_config *cfg)
+{
+	(void) conn;
+  cfg->kernel_cache = 1;
+	return NULL;
+}
+
+<<gfuse-read-getattr>>
+
+static int hello_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+			 off_t offset, struct fuse_file_info *fi,
+			 enum fuse_readdir_flags flags)
+{
+	(void) offset;
+	(void) fi;
+	(void) flags;
+
+	if (strcmp(path, "/") != 0)
+		return -ENOENT;
+
+	filler(buf, ".", NULL, 0, 0);
+	filler(buf, "..", NULL, 0, 0);
+	filler(buf, options.filename, NULL, 0, 0);
+
+	return 0;
+}
+
+static int hello_open(const char *path, struct fuse_file_info *fi)
+{
+	if (strcmp(path+1, options.filename) != 0)
+		return -ENOENT;
+
+	if ((fi->flags & O_ACCMODE) != O_RDONLY)
+		return -EACCES;
+
+	return 0;
+}
+
+<<first-hello-read>>
+
+static const struct fuse_operations hello_oper = {
+	.init           = hello_init,
+	.getattr	= hello_getattr,
+	.readdir	= hello_readdir,
+	.open		= hello_open,
+	.read		= hello_read,
+};
+
+static void show_help(const char *progname)
+{
+	printf("usage: %s [options] <mountpoint>\n\n", progname);
+	printf("File-system specific options:\n"
+	       "    --name=<s>          Name of the \"hello\" file\n"
+	       "                        (default: \"hello\")\n"
+	       "    --contents=<s>      Contents \"hello\" file\n"
+	       "                        (default \"Hello, World!\\n\")\n"
+	       "\n");
+}
+
+int _main(int argc, char *argv[])
+{
+	int ret;
+	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+
+	/* Set defaults -- we have to use strdup so that
+	   fuse_opt_parse can free the defaults if other
+	   values are specified */
+	options.filename = strdup("hello");
+	options.contents = strdup("Hello World!\n");
+
+
+	/* Parse options */
+	if (fuse_opt_parse(&args, &options, option_spec, NULL) == -1) {
+		return 1;
+    }
+
+	/* When --help is specified, first print our own file-system
+	   specific help text, then signal fuse_main to show
+	   additional help (by adding `--help` to the options again)
+	   without usage: line (by setting argv[0] to the empty
+	   string) */
+	if (options.show_help) {
+		show_help(argv[0]);
+		assert(fuse_opt_add_arg(&args, "--help") == 0);
+		args.argv[0][0] = '\0';
+	}
+
+	ret = fuse_main(args.argc, args.argv, &hello_oper, NULL);
+	fuse_opt_free_args(&args);
+	return ret;
+}
+
 #+end_src
 
 *** /File/ ~bin/hello.c~
@@ -525,7 +919,7 @@ static void *hello_init(struct fuse_conn_info *conn,
 			struct fuse_config *cfg)
 {
 	(void) conn;
-cfg->kernel_cache = 1;
+  cfg->kernel_cache = 1;
 	return NULL;
 }
 
@@ -935,6 +1329,7 @@ echo "))" >> $_file
       ,(fgxc "examples/try-main-hello")
       ,(fgxc "examples/first-hello")
       ,(fgxc "examples/second-hello")
+      ,(fgxc "examples/gfuse-read-hello")
                                         ;,(fgxc "examples/first-hello-exe")
       #;(gxc: "libfuse"
       "-cc-options"                     ;
@@ -951,7 +1346,9 @@ echo "))" >> $_file
 (def (build-exes)
   (defbuild-script
     `((exe: ,@(cdr (fgxc "examples/first-hello")))
-      (static-exe: ,@(cdr (fgxc "examples/second-hello"))))
+      (static-exe: ,@(cdr (fgxc "examples/second-hello")))
+      ;;(static-exe: ,@(cdr (fgxc "examples/gfuse-read-hello")))
+      )
     verbose: 1
     libdir: (path-directory (this-source-file))
     bindir: (path-expand "bin/" (path-directory (this-source-file))))
@@ -962,6 +1359,7 @@ echo "))" >> $_file
  (premade "examples/try-main-hello")
  (premade "examples/first-hello")
  (premade "examples/second-hello")
+ (premade "examples/gfuse-read-hello")
  (for-each copy-static
            (directory-files (path-expand "static/" (path-directory (this-source-file))))))
 
