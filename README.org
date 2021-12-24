@@ -698,6 +698,176 @@ ___return(res);"))
 #+end_src
 
 
+*** Static Build, Take II
+
+Ok, starting from "nothing", it currently fails.
+
+Here's a command line that fails the same as the ~build.ss~ currently does.
+
+#+begin_src shell
+_static_exe () {
+    gxc -static -d $(pwd) -g -v -exe \
+        -o bin/gfuse-read-hello -gsc-flag -keep-temp \
+        -ld-options "$(pkg-config fuse3 --libs)" \
+        -cc-options "$(pkg-config fuse3 --cflags)" \
+        examples/gfuse-read-hello.ss
+}
+_static_exe
+#+end_src
+
+#+begin_quote
+gfuse-read-hello.c: In function ‘gfuse_read’:
+gfuse-read-hello.c:651:23: error: ‘___C_LBL_gfuse_read’ undeclared (first use in this function)
+  651 | ___BEGIN_SFUN(___MLBL(___C_LBL_gfuse_read),int ___result)
+#+end_quote
+
+The ~-g~ and ~-keep-temp~ are there for reference so we can see as a non-static
+exe actually works.
+
+#+begin_src shell
+_exe () {
+    gxc -d $(pwd) -static -v \
+        -ld-options "$(pkg-config fuse3 --libs)" \
+        -cc-options "$(pkg-config fuse3 --cflags)" \
+        examples/gfuse-read-hello.ss
+    gxc -d $(pwd) -g -v -exe \
+    -o bin/gfuse-read-hello -gsc-flag -keep-temp \
+    -ld-options "$(pkg-config fuse3 --libs)" \
+    -cc-options "$(pkg-config fuse3 --cflags)"\
+    examples/gfuse-read-hello.ss
+}
+_exe
+#+end_src
+
+#+begin_src shell
+$ sudo GERBIL_LOADPATH=$(pwd) ./bin/gfuse-read-hello \
+    -o allow_other /tmp/gfuse-test/
+$ cat /tmp/gfuse-test/hello
+This is a byte sized string!
+sudo umount /tmp/gfuse-test
+#+end_src
+
+So the /trick/ will be to figure it all out.
+
+Let's get rid of the generated files and start from "scratch".
+
+#+begin_src shell
+_clean () {
+    find examples/ -name 'gfuse-r*.ssi' -or -name 'gf*.scm*' \
+        -or -name 'gfuse-*.c' -or -name 'gf*__*.o*'| xargs rm -v
+    ls bin/gfuse-read-hello* | xargs rm -v
+    find static -name '*gfuse-read*' -exec rm -v {} \;
+}
+#+end_src
+
+Now do the exe compile and find the difference.
+
+#+begin_src shell
+_clean
+find . -name '*gfuse-read*' > /tmp/gfrh.old
+_exe
+find . -name '*gfuse-read*' > /tmp/gfrh.new
+diff /tmp/gfrh*
+rm -v  /tmp/gfrh*
+#+end_src
+
+That diff tells us we have a bunch of generated files.
+
+#+begin_quote
+,2d0
+< ./examples/gfuse-read-hello__rt.o1
+< ./examples/gfuse-read-hello__0.o1
+4,9d1
+< ./examples/gfuse-read-hello__rt.scm
+< ./examples/gfuse-read-hello__0.scm
+< ./examples/gfuse-read-hello.ssi
+< ./examples/gfuse-read-hello__0.c
+< ./static/drewc__fuse__examples__gfuse-read-hello.scm
+< ./bin/gfuse-read-hello.scmx
+< ./bin/gfuse-read-hello
+#+end_quote
+
+They differ all differ in name so let's copy them and try the static exe.
+
+#+begin_src
+mkdir /tmp/gfuse-exec
+find . -name '*gfuse-read*' -exec cp -v {} /tmp/gfuse-exec \;
+#+end_src
+
+
+#+begin_src shell
+_clean
+find . -name '*gfuse-read*' > /tmp/gfrh.old
+_static_exe
+find . -name '*gfuse-read*' > /tmp/gfrh.new
+diff /tmp/gfrh*
+rm -v  /tmp/gfrh*
+#+end_src
+
+This tells us something!
+
+First the compilation before error tells us that ~-static~ does as we do for our ~_exe~ first. which is compile the module.
+
+#+begin_quote
+compile /home/drewc/src/gfuse/drewc/fuse/examples/gfuse-read-hello__0.scm
+copy static module /home/drewc/src/gfuse/drewc/fuse/examples/gfuse-read-hello__0.scm => /home/drewc/src/gfuse/static/drewc__fuse__examples__gfuse-read-hello.scm
+compile /home/drewc/src/gfuse/drewc/fuse/examples/gfuse-read-hello__rt.scm
+compile /home/drewc/src/gfuse/drewc/fuse/examples/gfuse-read-hello.ssi
+[...]
+#+end_quote
+
+And the ~diff~ tells us something as well.
+
+#+begin_quote
+2,3d1
+< ./examples/gfuse-read-hello__rt.scm
+< ./examples/gfuse-read-hello__0.scm
+5,8d2
+< ./examples/gfuse-read-hello.ssi
+< ./static/drewc__fuse__examples__gfuse-read-hello.scm
+< ./bin/gfuse-read-hello.scmx
+< ./bin/gfuse-read-hello.c
+#+end_quote
+
+Let's copy and differentiate!
+
+
+#+begin_src
+mkdir /tmp/gfuse-static
+find . -name '*gfuse-read*' -exec cp -v {} /tmp/gfuse-static \;
+#+end_src
+
+What's the diff? The ~.scmx~ is a big start.
+
+#+begin_src shell
+$ _gdiff () { _p1="/tmp/gfuse-static/gfuse-read-hello$1"; _p2="/tmp/gfuse-exec/gfuse-read-hello$1"; diff $_p2 $_p1; }
+$ _gdiff .ssi
+$ _gdiff __0.scm
+$ _gdiff __rt.scm
+$ _gdiff .scmx
+#+end_src
+#+begin_quote
+2,3c2,17
+< (include "/gnu/store/78dzdrv5a4c2rgk2ki058cfp244xfp04-gerbil-unstable-0.16-243-g87c6279b/lib/gerbil/lib/gx-init-exe.scm")
+< (_gx#start! "drewc/fuse/examples/gfuse-read-hello__rt" 'drewc/fuse/examples/gfuse-read-hello#main)
+---
+> (declare (optimize-dead-definitions))
+> (include "/gnu/store/78dzdrv5a4c2rgk2ki058cfp244xfp04-gerbil-unstable-0.16-243-g87c6279b/lib/gerbil/lib/static/gx-gambc0.scm")
+> (##namespace (""))(declare (gambit-scheme) (block) (core) (inline) (inline-primitives) (inlining-limit 350) (constant-fold) (lambda-lift) (standard-bindings) (extended-bindings) (run-time-bindings) (safe) (interrupts-enabled) (proper-tail-calls) (not generative-lambda) (optimize-dead-local-variables) (optimize-dead-definitions) (generic) (mostly-fixnum-flonum))
+> (include "/gnu/store/78dzdrv5a4c2rgk2ki058cfp244xfp04-gerbil-unstable-0.16-243-g87c6279b/lib/gerbil/lib/gx-init-static-exe.scm")
+> (##namespace (""))(declare (gambit-scheme) (block) (core) (inline) (inline-primitives) (inlining-limit 350) (constant-fold) (lambda-lift) (standard-bindings) (extended-bindings) (run-time-bindings) (safe) (interrupts-enabled) (proper-tail-calls) (not generative-lambda) (optimize-dead-local-variables) (optimize-dead-definitions) (generic) (mostly-fixnum-flonum))
+> (include "/gnu/store/78dzdrv5a4c2rgk2ki058cfp244xfp04-gerbil-unstable-0.16-243-g87c6279b/lib/gerbil/lib/static/gerbil__gambit__ports.scm")
+> (##namespace (""))(declare (gambit-scheme) (block) (core) (inline) (inline-primitives) (inlining-limit 350) (constant-fold) (lambda-lift) (standard-bindings) (extended-bindings) (run-time-bindings) (safe) (interrupts-enabled) (proper-tail-calls) (not generative-lambda) (optimize-dead-local-variables) (optimize-dead-definitions) (generic) (mostly-fixnum-flonum))
+> (include "/gnu/store/78dzdrv5a4c2rgk2ki058cfp244xfp04-gerbil-unstable-0.16-243-g87c6279b/lib/gerbil/lib/static/gerbil__gambit__random.scm")
+> (##namespace (""))(declare (gambit-scheme) (block) (core) (inline) (inline-primitives) (inlining-limit 350) (constant-fold) (lambda-lift) (standard-bindings) (extended-bindings) (run-time-bindings) (safe) (interrupts-enabled) (proper-tail-calls) (not generative-lambda) (optimize-dead-local-variables) (optimize-dead-definitions) (generic) (mostly-fixnum-flonum))
+> (include "/gnu/store/78dzdrv5a4c2rgk2ki058cfp244xfp04-gerbil-unstable-0.16-243-g87c6279b/lib/gerbil/lib/static/gerbil__gambit__threads.scm")
+> (##namespace (""))(declare (gambit-scheme) (block) (core) (inline) (inline-primitives) (inlining-limit 350) (constant-fold) (lambda-lift) (standard-bindings) (extended-bindings) (run-time-bindings) (safe) (interrupts-enabled) (proper-tail-calls) (not generative-lambda) (optimize-dead-local-variables) (optimize-dead-definitions) (generic) (mostly-fixnum-flonum))
+> (include "/home/drewc/src/gfuse/static/drewc__fuse__opt.scm")
+> (##namespace (""))(declare (gambit-scheme) (block) (core) (inline) (inline-primitives) (inlining-limit 350) (constant-fold) (lambda-lift) (standard-bindings) (extended-bindings) (run-time-bindings) (safe) (interrupts-enabled) (proper-tail-calls) (not generative-lambda) (optimize-dead-local-variables) (optimize-dead-definitions) (generic) (mostly-fixnum-flonum))
+> (include "/home/drewc/src/gfuse/static/drewc__fuse__examples__gfuse-read-hello.scm")
+> (##namespace (""))(declare (gambit-scheme) (block) (core) (inline) (inline-primitives) (inlining-limit 350) (constant-fold) (lambda-lift) (standard-bindings) (extended-bindings) (run-time-bindings) (safe) (interrupts-enabled) (proper-tail-calls) (not generative-lambda) (optimize-dead-local-variables) (optimize-dead-definitions) (generic) (mostly-fixnum-flonum))
+> (apply drewc/fuse/examples/gfuse-read-hello#main (cdr (command-line)))
+#+end_quote
 
 
 *** /File/ ~examples/fuse_read-hello.c~
@@ -1329,7 +1499,13 @@ echo "))" >> $_file
       ,(fgxc "examples/try-main-hello")
       ,(fgxc "examples/first-hello")
       ,(fgxc "examples/second-hello")
-      ,(fgxc "examples/gfuse-read-hello")
+       ,(let (libs (cddr (fgxc "asd")))
+         ;; (displayln " Libs ~a" libs)
+         `(gxc: "examples/gfuse-read-hello"
+                ["-s"] "-keep-temp" ,@libs))
+
+
+             ;  '("-s" "-gsc-flag" "-keep-temp"))
                                         ;,(fgxc "examples/first-hello-exe")
       #;(gxc: "libfuse"
       "-cc-options"                     ;
@@ -1347,7 +1523,8 @@ echo "))" >> $_file
   (defbuild-script
     `((exe: ,@(cdr (fgxc "examples/first-hello")))
       (static-exe: ,@(cdr (fgxc "examples/second-hello")))
-      ;;(static-exe: ,@(cdr (fgxc "examples/gfuse-read-hello")))
+      #;(static-exe: ,@(cdr (fgxc "examples/gfuse-read-hello"
+                                "-flat")))
       )
     verbose: 1
     libdir: (path-directory (this-source-file))
