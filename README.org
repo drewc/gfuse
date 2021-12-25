@@ -674,8 +674,8 @@ again.
 (def (main . args)
   (%main (fuse_args<-list
           [(car ##processed-command-line) args ...])))
-
-(begin-ffi (%main fuse_args*)
+(def i-am-not-dead gfuse-read)
+(begin-ffi (%main fuse_args* gfuse-read)
   (namespace ("drewc/fuse/examples/first-read-hello#"
               file-contents))
   (c-declare "#define FUSE_USE_VERSION 31")
@@ -684,10 +684,9 @@ again.
   (c-declare "static int gfuse_read(char *, char *, long unsigned int,  int,  struct fuse_file_info *);")
   <<hello-gfuse-file-size>>
   (c-declare "#include \"gfuse_read-hello.c\"")
-
+  <<gfuse-read>>
   <<first-contents>>
   <<extern-c-struct>>
-  <<gfuse-read>>
   <<hello-gfuse-read-bytes>>
   (extern-c-struct fuse_args)
   (define-c-lambda %main (fuse_args*) int "
@@ -869,6 +868,18 @@ $ _gdiff .scmx
 > (apply drewc/fuse/examples/gfuse-read-hello#main (cdr (command-line)))
 #+end_quote
 
+
+Time to figure it out.
+
+When doing static ~gxc~ calls ~gsc~ as follows.
+
+#+begin_src shell
+gsc -:i8,f8,-8,t8 -exe -o bin/gfuse-read-hello -keep-temp \
+    -ld-options "$(pkg-config fuse3 --libs)" \
+    -cc-options "$(pkg-config fuse3 --cflags) -I /gnu/store/78dzdrv5a4c2rgk2ki058cfp244xfp04-gerbil-unstable-0.16-243-g87c6279b/lib/gerbil/lib/static -I ~/.gerbil/lib/static"\
+    -e '(include "/gnu/store/78dzdrv5a4c2rgk2ki058cfp244xfp04-gerbil-unstable-0.16-243-g87c6279b/lib/gerbil/lib/static/gx-gambc#.scm")' \
+    bin/gfuse-read-hello.scmx
+#+end_src
 
 *** /File/ ~examples/fuse_read-hello.c~
 :PROPERTIES:
@@ -1439,13 +1450,18 @@ echo "))" >> $_file
 
 #+begin_src gerbil :tangle build.ss :shebang #!/usr/bin/env gxi
 (import :std/build-script :std/make
-        :gerbil/gambit/ports)
+        :gerbil/gambit/ports :gerbil/compiler/driver)
 
 (def libs "fuse3")
 (def gerbil-path (getenv "GERBIL_PATH" "~/.gerbil"))
+(def gerbil-home (getenv "GERBIL_HOME" gxc#default-gerbil-home))
+
+(def srcdir (path-directory (this-source-file)))
 (def libdir (path-expand "lib" gerbil-path))
 (def bindir (path-expand "bin" gerbil-path))
 (def statdir (path-expand "static" libdir))
+(def gerbil-gsc std/make#gerbil-gsc)
+(def gambcsharp (path-expand "lib/static/gx-gambc#.scm" gerbil-home))
 
 (def (fgxc fn . rest)
   (cons*
@@ -1455,6 +1471,9 @@ echo "))" >> $_file
    "-ld-options"
    (pkg-config-libs libs)
    rest))
+
+(def -cc-ld
+  (list "-cc-options" (pkg-config-cflags libs) "-ld-options" (pkg-config-libs libs)))
 
 (def (force-outputs) (force-output (current-error-port)) (force-output))
 (def (message . lst) (apply displayln lst) (force-outputs))
@@ -1475,6 +1494,37 @@ echo "))" >> $_file
   (when (file-exists? spath)
     (delete-file spath))
   (copy-file fpath spath))
+
+(def (g-compile-static-exe file)
+  (def fn (path-strip-extension file))
+  (def scmx (string-append fn ".scmx"))
+  (def bin (path-expand (path-strip-directory fn) "./bin/"))
+  (def -e (string-append "(include \"" gambcsharp "\")"))
+  (def (gxcomp)
+    (compile-static-exe
+     (string-append fn ".ss")
+     [ verbose: #t
+       invoke-gsc: #f
+       output-file: file keep-scm: #t
+     ]))
+  (def (gscomp)
+    (let* ((proc (open-process
+                  [path: (gerbil-gsc)
+                   arguments: [ "-:i8,f8,-8,t8" #;"-verbose" "-exe" "-o" bin -cc-ld ... "-e" -e scmx]
+                   stdout-redirection: #f]))
+         (status (process-status proc)))
+    (close-port proc)
+    (unless (zero? status)
+      (error "Compilation error; gsc exited with nonzero status" status)))
+    )
+  (gxcomp)
+  (shell-command (string-append
+                  "sed 's/(optimize-dead-definitions)//g' -i "
+                  scmx))
+  (gscomp))
+
+
+
 
 (def (premade path)
   (def posts
@@ -1499,10 +1549,11 @@ echo "))" >> $_file
       ,(fgxc "examples/try-main-hello")
       ,(fgxc "examples/first-hello")
       ,(fgxc "examples/second-hello")
-       ,(let (libs (cddr (fgxc "asd")))
-         ;; (displayln " Libs ~a" libs)
-         `(gxc: "examples/gfuse-read-hello"
-                ["-s"] "-keep-temp" ,@libs))
+      ,(fgxc "examples/gfuse-read-hello")
+       ;; ,(let (libs (cddr (fgxc "asd")))
+       ;;   ;; (displayln " Libs ~a" libs)
+       ;;   `(gxc: "examples/gfuse-read-hello"
+       ;;          ["-s"] "-keep-temp" ,@libs))
 
 
              ;  '("-s" "-gsc-flag" "-keep-temp"))
@@ -1542,14 +1593,16 @@ echo "))" >> $_file
 
 
 (def (main . args)
+  (parameterize ((current-directory srcdir))
   (if (and (pair? args) (equal? (car args) "clean"))
     (make-clean)
     (begin
       (make-clean)
       (local-build)
       (make-install)
+      (g-compile-static-exe "examples/gfuse-read-hello")
       (build-exes)
-      (make-install))))
+      (make-install)))))
 
 #+end_src
 #+begin_src

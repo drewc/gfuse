@@ -1,12 +1,17 @@
 #!/usr/bin/env gxi
 (import :std/build-script :std/make
-        :gerbil/gambit/ports)
+        :gerbil/gambit/ports :gerbil/compiler/driver)
 
 (def libs "fuse3")
 (def gerbil-path (getenv "GERBIL_PATH" "~/.gerbil"))
+(def gerbil-home (getenv "GERBIL_HOME" gxc#default-gerbil-home))
+
+(def srcdir (path-directory (this-source-file)))
 (def libdir (path-expand "lib" gerbil-path))
 (def bindir (path-expand "bin" gerbil-path))
 (def statdir (path-expand "static" libdir))
+(def gerbil-gsc std/make#gerbil-gsc)
+(def gambcsharp (path-expand "lib/static/gx-gambc#.scm" gerbil-home))
 
 (def (fgxc fn . rest)
   (cons*
@@ -16,6 +21,9 @@
    "-ld-options"
    (pkg-config-libs libs)
    rest))
+
+(def -cc-ld
+  (list "-cc-options" (pkg-config-cflags libs) "-ld-options" (pkg-config-libs libs)))
 
 (def (force-outputs) (force-output (current-error-port)) (force-output))
 (def (message . lst) (apply displayln lst) (force-outputs))
@@ -36,6 +44,37 @@
   (when (file-exists? spath)
     (delete-file spath))
   (copy-file fpath spath))
+
+(def (g-compile-static-exe file)
+  (def fn (path-strip-extension file))
+  (def scmx (string-append fn ".scmx"))
+  (def bin (path-expand (path-strip-directory fn) "./bin/"))
+  (def -e (string-append "(include \"" gambcsharp "\")"))
+  (def (gxcomp)
+    (compile-static-exe
+     (string-append fn ".ss")
+     [ verbose: #t
+       invoke-gsc: #f
+       output-file: file keep-scm: #t
+     ]))
+  (def (gscomp)
+    (let* ((proc (open-process
+                  [path: (gerbil-gsc)
+                   arguments: [ "-:i8,f8,-8,t8" #;"-verbose" "-exe" "-o" bin -cc-ld ... "-e" -e scmx]
+                   stdout-redirection: #f]))
+         (status (process-status proc)))
+    (close-port proc)
+    (unless (zero? status)
+      (error "Compilation error; gsc exited with nonzero status" status)))
+    )
+  (gxcomp)
+  (shell-command (string-append
+                  "sed 's/(optimize-dead-definitions)//g' -i "
+                  scmx))
+  (gscomp))
+
+
+
 
 (def (premade path)
   (def posts
@@ -61,6 +100,13 @@
       ,(fgxc "examples/first-hello")
       ,(fgxc "examples/second-hello")
       ,(fgxc "examples/gfuse-read-hello")
+       ;; ,(let (libs (cddr (fgxc "asd")))
+       ;;   ;; (displayln " Libs ~a" libs)
+       ;;   `(gxc: "examples/gfuse-read-hello"
+       ;;          ["-s"] "-keep-temp" ,@libs))
+
+
+             ;  '("-s" "-gsc-flag" "-keep-temp"))
                                         ;,(fgxc "examples/first-hello-exe")
       #;(gxc: "libfuse"
       "-cc-options"                     ;
@@ -78,7 +124,8 @@
   (defbuild-script
     `((exe: ,@(cdr (fgxc "examples/first-hello")))
       (static-exe: ,@(cdr (fgxc "examples/second-hello")))
-      ;;(static-exe: ,@(cdr (fgxc "examples/gfuse-read-hello")))
+      #;(static-exe: ,@(cdr (fgxc "examples/gfuse-read-hello"
+                                "-flat")))
       )
     verbose: 1
     libdir: (path-directory (this-source-file))
@@ -96,11 +143,13 @@
 
 
 (def (main . args)
+  (parameterize ((current-directory srcdir))
   (if (and (pair? args) (equal? (car args) "clean"))
     (make-clean)
     (begin
       (make-clean)
       (local-build)
       (make-install)
+      (g-compile-static-exe "examples/gfuse-read-hello")
       (build-exes)
-      (make-install))))
+      (make-install)))))
