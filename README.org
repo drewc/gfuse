@@ -476,7 +476,7 @@ $ cat /tmp/gfuse-test/hello-gerbil
 cat: /tmp/gfuse-test/hello-gerbil: No such file or directory
 #+end_src
 
-*** ~gfuse_read~: part 1.
+*** ~gfuse_read~ part I: ~file-contents~
 
 Right now we just pass strings to *C* and it takes care of the rest.
 
@@ -517,7 +517,7 @@ So first the *C* function.
 static int hello_read(const char *path, char *buf, size_t size, off_t offset,
 		      struct fuse_file_info *fi)
 {
-  int ret = gfuse_read(path, buf, size, offset, fi);
+  int ret = gfuse_read((char *)path, buf, size, offset, fi);
   return ret;
 
 };
@@ -584,6 +584,7 @@ $  cat /tmp/gfuse-test/hello
 This is a byt$
 #+end_src
 
+**** ~getattr~
 The reason why is actually simple. I jumped ahead, and before ~hello_read~ is in fact ~hello_getattr~ which returns the length as ~strlen(options.contents)~ which is not right.
 
 #+begin_src c
@@ -664,37 +665,6 @@ gfuse-read-hello.c:651:23: error: ‘___C_LBL_gfuse_read’ undeclared (first us
 
 Still, works enough to move onto the next step which may be the static build
 again.
-
-
-
-#+begin_src scheme :tangle ./examples/gfuse-read-hello.ss :noweb yes
-(export (import: ../opt) main)
-(import :std/foreign :gerbil/gambit/foreign ../opt :gerbil/gambit)
-
-(def (main . args)
-  (%main (fuse_args<-list
-          [(car ##processed-command-line) args ...])))
-(def i-am-not-dead gfuse-read)
-(begin-ffi (%main fuse_args* gfuse-read)
-  (namespace ("drewc/fuse/examples/first-read-hello#"
-              file-contents))
-  (c-declare "#define FUSE_USE_VERSION 31")
-  (c-declare "#include <fuse.h>")
-  (c-declare "#include <fuse_opt.h>")
-  (c-declare "static int gfuse_read(char *, char *, long unsigned int,  int,  struct fuse_file_info *);")
-  <<hello-gfuse-file-size>>
-  (c-declare "#include \"gfuse_read-hello.c\"")
-  <<gfuse-read>>
-  <<first-contents>>
-  <<extern-c-struct>>
-  <<hello-gfuse-read-bytes>>
-  (extern-c-struct fuse_args)
-  (define-c-lambda %main (fuse_args*) int "
-int res = _main(___arg1->argc, ___arg1->argv);
-___return(res);"))
-
-
-#+end_src
 
 
 *** Static Build, Take II
@@ -836,6 +806,8 @@ mkdir /tmp/gfuse-static
 find . -name '*gfuse-read*' -exec cp -v {} /tmp/gfuse-static \;
 #+end_src
 
+**** The real ~diff~
+
 What's the diff? The ~.scmx~ is a big start.
 
 #+begin_src shell
@@ -869,19 +841,490 @@ $ _gdiff .scmx
 #+end_quote
 
 
-Time to figure it out.
+Time to figure it out. While having a break and eating a pear my mind said "what about those ~declare~'ations?".
 
-When doing static ~gxc~ calls ~gsc~ as follows.
+It turns out that by commenting them out and building I was able to figure out
+that ~(optimize-dead-definitions)~ is what the issue is.
 
-#+begin_src shell
-gsc -:i8,f8,-8,t8 -exe -o bin/gfuse-read-hello -keep-temp \
-    -ld-options "$(pkg-config fuse3 --libs)" \
-    -cc-options "$(pkg-config fuse3 --cflags) -I /gnu/store/78dzdrv5a4c2rgk2ki058cfp244xfp04-gerbil-unstable-0.16-243-g87c6279b/lib/gerbil/lib/static -I ~/.gerbil/lib/static"\
-    -e '(include "/gnu/store/78dzdrv5a4c2rgk2ki058cfp244xfp04-gerbil-unstable-0.16-243-g87c6279b/lib/gerbil/lib/static/gx-gambc#.scm")' \
-    bin/gfuse-read-hello.scmx
+
+**** Deep dive into how static exes compile.
+
+So, here's a way to go about changing the file. This is *NOT* the solution, as
+it bloats the exe terribly. At the same time it's useful for hacking, especially
+for dummies like me, and there you go.
+
+Essentially, ~sed 's/(optimize-dead-definitions)//g' -i $scmx~ is what happens.
+
+#+begin_src scheme
+(def (g-compile-static-exe file)
+  (def fn (path-strip-extension file))
+  (def scmx (string-append fn ".scmx"))
+  (def bin (path-expand (path-strip-directory fn) "./bin/"))
+  (def -e (string-append "(include \"" gambcsharp "\")"))
+  (def (gxcomp)
+    (compile-static-exe
+     (string-append fn ".ss")
+     [ verbose: #t
+       invoke-gsc: #f
+       output-file: file keep-scm: #t
+     ]))
+  (def (gscomp)
+    (let* ((proc (open-process
+                  [path: (gerbil-gsc)
+                   arguments: [ "-:i8,f8,-8,t8" #;"-verbose" "-exe" "-o" bin -cc-ld ... "-e" -e scmx]
+                   stdout-redirection: #f]))
+         (status (process-status proc)))
+    (close-port proc)
+    (unless (zero? status)
+      (error "Compilation error; gsc exited with nonzero status" status)))
+    )
+  (gxcomp)
+  (shell-command (string-append
+                  "sed 's/(optimize-dead-definitions)//g' -i "
+                  scmx))
+  (gscomp))
 #+end_src
 
-*** /File/ ~examples/fuse_read-hello.c~
+**** Make ~(declare (not optimize-dead-definitions))~ to solve!
+
+Though that works, it's not ideal. While saying so in the *Gerbil* chat room,
+the master @vyzo mentioned something that this dummy had not yet thought about.
+
+I have another pear to eat for just such an occaision, but nonetheless:
+
+#+begin_quote
+it must be the tree shaker
+try adding (not optimize-dead-definitions) decl in your module
+dont blanket remove it, you'll get horrible bloat
+just turn off the tree shaker in modules with ffi upcalls, with the decl
+#+end_quote
+
+See? That bloat I mentioned earlier? I did not even check the executable size,
+that was me trying to look smart.
+
+So, by simply adding that declaration it now builds!
+
+#+begin_src scheme
+(declare (not optimize-dead-definitions))
+#+end_src
+
+Test out the build.
+
+#+begin_src shell
+$ sudo ./bin/gfuse-read-hello -o allow_other /tmp/gfuse-test/
+Password:
+$ cat /tmp/gfuse-test/hello
+This is a byte sized string!
+$ sudo umount /tmp/gfuse-test
+#+end_src
+
+**** /File/ ~examples/gfuse-read-hello.ss~
+
+#+begin_src scheme :tangle ./examples/gfuse-read-hello.ss :noweb yes
+(export (import: ../opt) main)
+(import :std/foreign :gerbil/gambit/foreign ../opt :gerbil/gambit)
+(declare (not optimize-dead-definitions))
+(def (main . args)
+  (%main (fuse_args<-list
+          [(car ##processed-command-line) args ...])))
+
+(begin-ffi (%main fuse_args* gfuse-read)
+  (namespace ("drewc/fuse/examples/first-read-hello#"
+              file-contents))
+  (c-declare "#define FUSE_USE_VERSION 31")
+  (c-declare "#include <fuse.h>")
+  (c-declare "#include <fuse_opt.h>")
+  (c-declare "static int gfuse_read(char *, char *, long unsigned int,  int,  struct fuse_file_info *);")
+  <<hello-gfuse-file-size>>
+  (c-declare "#include \"gfuse_read-hello.c\"")
+  <<gfuse-read>>
+  <<first-contents>>
+  <<extern-c-struct>>
+  <<hello-gfuse-read-bytes>>
+  (extern-c-struct fuse_args)
+  (define-c-lambda %main (fuse_args*) int "
+int res = _main(___arg1->argc, ___arg1->argv);
+___return(res);"))
+
+
+#+end_src
+
+*** Make ~--name~ and ~--contents~ work.
+
+We can pass a bytearray. Now the new ~file-name~ and the old ~file-contents~
+should be passed as well.
+
+**** ~getopt~ sets ~file-contents~.
+
+We need to turn command line arguments into scheme and then into C.
+
+Here's what ~--help~ tells us.
+
+#+begin_quote
+usage: ./bin/gfuse-read-hello [options] <mountpoint>
+
+File-system specific options:
+    --name=<s>          Name of the "hello" file
+                        (default: "hello")
+    --contents=<s>      Contents "hello" file
+                        (default "Hello, World!\n")
+
+FUSE options:
+    -h   --help            print help
+    -V   --version         print version
+    -d   -o debug          enable debug output (implies -f)
+    -f                     foreground operation
+    -s                     disable multi-threaded operation
+    -o clone_fd            use separate fuse device fd for each thread
+                           (may improve performance)
+    -o max_idle_threads    the maximum number of idle worker threads
+                           allowed (default: 10)
+    -o kernel_cache        cache files in kernel
+    -o [no]auto_cache      enable caching based on modification times (off)
+    -o umask=M             set file permissions (octal)
+    -o uid=N               set file owner
+    -o gid=N               set file group
+    -o entry_timeout=T     cache timeout for names (1.0s)
+    -o negative_timeout=T  cache timeout for deleted names (0.0s)
+    -o attr_timeout=T      cache timeout for attributes (1.0s)
+    -o ac_attr_timeout=T   auto cache timeout for attributes (attr_timeout)
+    -o noforget            never forget cached inodes
+    -o remember=T          remember cached inodes for T seconds (0s)
+    -o modules=M1[:M2...]  names of modules to push onto filesystem stack
+    -o allow_other         allow access by all users
+    -o allow_root          allow access by root
+    -o auto_unmount        auto unmount on process termination
+
+Options for subdir module:
+    -o subdir=DIR           prepend this directory to all paths (mandatory)
+    -o [no]rellinks         transform absolute symlinks to relative
+
+Options for iconv module:
+    -o from_code=CHARSET   original encoding of file names (default: UTF-8)
+    -o to_code=CHARSET     new encoding of the file names (default: UTF-8)
+
+#+end_quote
+
+So here's a ~go~ at it.
+
+We'll ~define~ some foreign variables.
+
+#+begin_src scheme :noweb-ref second-contents-fn
+(define file-contents (string->bytes "This is a set! string!\n"))
+(define file-name "hello-getopt")
+#+end_src
+
+Those should ultimately be ~set!~ from ~getopt-parse~.
+
+#+begin_src scheme :noweb-ref first-go
+(def go
+  (getopt
+   (option '--name "--name"
+           help: "Name of the \"hello\" file"
+           default: "hello")
+   (option '--contents "--contents"
+           help: "Contents of the \"hello\" file"
+           default: "Hello World!\n")
+   (flag '--help "-h" "--help")
+   (flag '--version "-V" "--version")
+   (flag '-d "-d")
+   (flag '-f "-f")
+   (flag '-s "-s")
+   (option '-o "-o")
+   ;;; Not needed for --help
+   (optional-argument '<mountpoint>)))
+#+end_src
+
+Now with the exceptions of our two options we want to pass the rest onto fuse.
+
+#+begin_src scheme :noweb-ref getopts->fuse
+
+(def (getopts->fuse tbl)
+  (def args [])
+  (def mp #f)
+  (def opts (table->list tbl))
+  (def (opt->lst pair)
+    (match pair
+      ([key . val]
+       (let (optk (symbol->string key))
+         (cond ((boolean? val) (if val [optk] []))
+               ((list? val)
+                (let lp ((v val))
+                  (if (null? v) v
+                      (cons* optk (car v)
+                             (lp (cdr v))))))
+               (else [optk val]))))))
+
+  (for-each (lambda (pair)
+              (match pair
+                ([name . val]
+                 (cond
+                  ((eq? name '<mountpoint>) (set! mp val))
+                  ((eq? name '--name) (set! file-name val))
+                  ((eq? name '--contents)
+                   (set! file-contents
+                     (string->bytes val)))
+                  (else (push! (opt->lst pair) args))))))
+            opts)
+
+  (when mp (push! [mp] args))
+
+  (set! args (reverse! args))
+  (append-map (lambda (a) (if (list? a) a [a])) args))
+
+#+end_src
+
+Just with that the ~--contents~ are taken care of.
+
+#+begin_src shell
+$ sudo ./bin/gfuse-getopt-hello --contents $'This is the new contents you know \n' -o  allow_other  /tmp/gfuse-test
+$ cat /tmp/gfuse-test/hello
+This is the new contents you know
+$ sudo umount -f /tmp/gfuse-test
+#+end_src
+
+**** File name
+
+We already know the size is in ~hello_getattr~.
+
+That's also one place where the name appears. Simply make it
+~gfuse_file_name()~;
+
+#+begin_src c :noweb-ref gfuse-getopt-getattr
+static int hello_getattr(const char *path, struct stat *stbuf,
+			 struct fuse_file_info *fi)
+{
+	(void) fi;
+	int res = 0;
+    char* name = gfuse_file_name();
+
+	memset(stbuf, 0, sizeof(struct stat));
+	if (strcmp(path, "/") == 0) {
+		stbuf->st_mode = S_IFDIR | 0755;
+		stbuf->st_nlink = 2;
+	} else if (strcmp(path+1, name) == 0) {
+		stbuf->st_mode = S_IFREG | 0444;
+		stbuf->st_nlink = 1;
+		stbuf->st_size = gfuse_file_size();
+	} else
+		res = -ENOENT;
+
+	return res;
+}
+#+end_src
+
+
+It also needs to be in ~hello_readdir~ and ~hello_open~
+
+#+begin_src c :noweb-ref gfuse-getopt-dir-open
+static int hello_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+			 off_t offset, struct fuse_file_info *fi,
+			 enum fuse_readdir_flags flags)
+{
+	(void) offset;
+	(void) fi;
+	(void) flags;
+
+    char* name = gfuse_file_name();
+
+    if (strcmp(path, "/") != 0)
+		return -ENOENT;
+
+	filler(buf, ".", NULL, 0, 0);
+	filler(buf, "..", NULL, 0, 0);
+	filler(buf, name ,NULL, 0, 0);
+
+
+	return 0;
+}
+
+static int hello_open(const char *path, struct fuse_file_info *fi)
+{
+
+    char* name = gfuse_file_name();
+	if (strcmp(path+1, name) != 0)
+		return -ENOENT;
+
+	if ((fi->flags & O_ACCMODE) != O_RDONLY)
+		return -EACCES;
+
+	return 0;
+}
+#+end_src
+
+We also need to change the ~gfuse-read-bytes~ C portion so it look for that
+correct name.
+
+#+begin_src scheme :noweb-ref gfuse-getopt-read-bytes
+(define-c-lambda gfuse-read-bytes
+  (scheme-object char-string (pointer char) size_t int fuse_file_info*)
+  int
+  "
+  ___SCMOBJ bytes = ___arg1;
+  char *path= ___arg2;
+  char *buf = ___arg3;
+	size_t len;
+  size_t size = ___arg4;
+  int offset = ___arg5;
+
+  (void) ___arg6;
+
+  char* name = gfuse_file_name();
+
+	if(strcmp(path+1, name) != 0)
+		___return(-ENOENT);
+
+	len = U8_LEN (bytes);
+
+	if (offset < len) {
+		if (offset + size > len)
+			size = len - offset;
+		memcpy(buf, U8_DATA (bytes) + offset, size);
+	} else
+		size = 0;
+
+	___return(size);
+    ")
+#+end_src
+
+Now the ~gfuse_file_name()~.
+
+#+begin_src scheme :noweb-ref hello-gfuse-file-name
+(c-define
+ (gfuse-file-name) ()
+  char-string "gfuse_file_name" "" file-name)
+#+end_src
+
+And given that it now works!
+
+#+begin_src shell
+$ sudo ./bin/gfuse-getopt-hello \
+    --name 'hello-gerbil' \
+    --contents $'This is the new contents you know \n' \
+    -o allow_other /tmp/gfuse-test
+$ ls /tmp/gfuse-test/
+hello-gerbil
+$ cat /tmp/gfuse-test/hello-gerbil
+This is the new contents you know
+#+end_src
+
+
+**** /File/ ~examples/gfuse-getopt-hello.ss~
+
+#+begin_src scheme :tangle ./examples/gfuse-getopt-hello.ss :noweb yes
+(export (import: ../opt) main)
+(import :std/foreign :gerbil/gambit/foreign ../opt :gerbil/gambit
+        :std/misc/list :std/getopt :std/srfi/1)
+(declare (not optimize-dead-definitions))
+
+<<getopts->fuse>>
+
+<<first-go>>
+
+(def (main . args)
+  (def go-args (getopt-parse go args))
+  (def fargs (getopts->fuse go-args))
+  (%main (fuse_args<-list
+          [(car ##processed-command-line) fargs ...])))
+
+(begin-ffi (%main fuse_args* gfuse-read
+            file-contents file-name)
+  (c-declare "#define FUSE_USE_VERSION 31")
+  (c-declare "#include <fuse.h>")
+  (c-declare "#include <fuse_opt.h>")
+  (c-declare "static int gfuse_read(char *, char *, long unsigned int,  int,  struct fuse_file_info *);")
+  <<hello-gfuse-file-size>>
+  <<hello-gfuse-file-name>>
+  (c-declare "#include \"gfuse_getopt-hello.c\"")
+  <<gfuse-read>>
+  <<second-contents-fn>>
+  <<extern-c-struct>>
+  <<gfuse-getopt-read-bytes>>
+  (extern-c-struct fuse_args)
+  (define-c-lambda %main (fuse_args*) int "
+int res = _main(___arg1->argc, ___arg1->argv);
+___return(res);"))
+
+
+#+end_src
+**** /File/ ~examples/gfuse_getopt-hello.c~
+:PROPERTIES:
+:CUSTOM_ID: exFuseGetoptHello
+:END:
+
+#+begin_src c :tangle ./examples/gfuse_getopt-hello.c :noweb yes
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU GPLv2.
+  See the file COPYING.
+,*/
+
+/** @file
+ ,*
+ ,* minimal example filesystem using high-level API
+ ,*
+ ,* Compile with:
+ ,*
+ ,*     gcc -Wall hello.c `pkg-config fuse3 --cflags --libs` -o hello
+ ,*
+ ,* ## Source code ##
+ ,* \include hello.c
+ ,*/
+
+
+#define FUSE_USE_VERSION 31
+
+#include <fuse.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stddef.h>
+#include <assert.h>
+
+static void *hello_init(struct fuse_conn_info *conn,
+			struct fuse_config *cfg)
+{
+	(void) conn;
+  cfg->kernel_cache = 1;
+	return NULL;
+}
+
+<<gfuse-getopt-getattr>>
+
+<<gfuse-getopt-dir-open>>
+<<first-hello-read>>
+
+static const struct fuse_operations hello_oper = {
+	.init           = hello_init,
+	.getattr	= hello_getattr,
+	.readdir	= hello_readdir,
+	.open		= hello_open,
+	.read		= hello_read,
+};
+
+
+int _main(int argc, char *argv[])
+{
+	int ret;
+	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+
+
+	/* Parse options */
+	if (fuse_opt_parse(&args, NULL, NULL, NULL) == -1) {
+		return 1;
+    }
+
+	ret = fuse_main(args.argc, args.argv, &hello_oper, NULL);
+	fuse_opt_free_args(&args);
+	return ret;
+}
+
+#+end_src
+
+*** /File/ ~examples/gfuse_read-hello.c~
 :PROPERTIES:
 :CUSTOM_ID: exFuseReadHello
 :END:
@@ -1481,11 +1924,12 @@ echo "))" >> $_file
 (def (copy-compiled file)
   (def libpath (path-expand (string-append "drewc/fuse/" file) libdir))
   (create-directory* (path-directory libpath))
+  (when (file-exists? file)
   (message "... copy " file " to " libpath)
 
   (when (file-exists? libpath)
     (delete-file libpath))
-  (copy-file file libpath))
+  (copy-file file libpath)))
 
 (def (copy-static file)
   (def spath (path-expand file statdir))
@@ -1529,6 +1973,7 @@ echo "))" >> $_file
 (def (premade path)
   (def posts
     '("__0.o1"
+      "__1.o1"
       "__rt.o1"
       ".ssi"
       ".ssxi.ss"))
@@ -1544,12 +1989,13 @@ echo "))" >> $_file
 
 (def (local-build)
   (defbuild-script
-    `(                                  ; "c2ffi-libfuse"
+    `((gxc: "getopt")                                 ; "c2ffi-libfuse"
       ,(fgxc "opt")
       ,(fgxc "examples/try-main-hello")
       ,(fgxc "examples/first-hello")
       ,(fgxc "examples/second-hello")
       ,(fgxc "examples/gfuse-read-hello")
+      ,(fgxc "examples/gfuse-getopt-hello")
        ;; ,(let (libs (cddr (fgxc "asd")))
        ;;   ;; (displayln " Libs ~a" libs)
        ;;   `(gxc: "examples/gfuse-read-hello"
@@ -1573,7 +2019,10 @@ echo "))" >> $_file
 (def (build-exes)
   (defbuild-script
     `((exe: ,@(cdr (fgxc "examples/first-hello")))
-      (static-exe: ,@(cdr (fgxc "examples/second-hello")))
+      ;(static-exe:(cdr (fgxc "examples/second-hello")))
+      (static-exe: "examples/second-hello" ,@-cc-ld)
+      (static-exe: "examples/gfuse-read-hello" ,@-cc-ld)
+      (static-exe: "examples/gfuse-getopt-hello" ,@-cc-ld)
       #;(static-exe: ,@(cdr (fgxc "examples/gfuse-read-hello"
                                 "-flat")))
       )
@@ -1583,13 +2032,16 @@ echo "))" >> $_file
   (main))
 
 (def (make-install)
+ (premade "getopt")
  (premade "opt")
  (premade "examples/try-main-hello")
  (premade "examples/first-hello")
  (premade "examples/second-hello")
  (premade "examples/gfuse-read-hello")
+ (premade "examples/gfuse-getopt-hello")
  (for-each copy-static
-           (directory-files (path-expand "static/" (path-directory (this-source-file))))))
+           (directory-files
+            (path-expand "static/" (path-directory (this-source-file))))))
 
 
 (def (main . args)
@@ -1600,7 +2052,7 @@ echo "))" >> $_file
       (make-clean)
       (local-build)
       (make-install)
-      (g-compile-static-exe "examples/gfuse-read-hello")
+      ;; (g-compile-static-exe "examples/gfuse-read-hello")
       (build-exes)
       (make-install)))))
 

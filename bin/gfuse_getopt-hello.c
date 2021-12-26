@@ -1,0 +1,1 @@
+../examples/gfuse_getopt-hello.c
