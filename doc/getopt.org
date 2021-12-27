@@ -2,10 +2,12 @@
   :PROPERTIES:
   :CUSTOM_ID: command-line-argument-parsing
   :END:
-The =:std/getopt= library provides facilities for command line argument
-parsing.
 
-::: tip usage (import :std/getopt) :::
+The ~:std/getopt~ library provides facilities for command line argument parsing.
+
+#+begin_src scheme
+(import :std/getopt)
+#+end_src
 
 ** Interface
    :PROPERTIES:
@@ -33,8 +35,8 @@ parsing.
    (rest-arguments id [help: text] [value: proc])
 #+end_example
 
-::: =getopt= creates a command line parser, which can be used to parse
-arguments with =getopt-parse=.
+::: =getopt= creates a command line parser, which can be used to parse arguments
+with ~getopt-parse~.
 
 *** getopt-parse
     :PROPERTIES:
@@ -48,7 +50,7 @@ arguments with =getopt-parse=.
      options
 #+end_example
 
-::: =getopt-parse= accepts a parser and a list of string arguments and
+::: ~getopt-parse~ accepts a parser and a list of string arguments and
 parses according to the parser specification. If it is parsing a
 specification with subcommands, it returns two values, the command id
 and a hash table with the parsed options. Otherwise it just returns the
@@ -68,8 +70,8 @@ the arguments fails.
 
 :::
 
-If parsing fails, then a =getopt-error= is raised, which can be guarded
-with =getopt-error?=.
+If parsing fails, then a ~getopt-error~ is raised, which can be guarded
+with ~getopt-error?~.
 
 *** getopt-display-help
     :PROPERTIES:
@@ -89,7 +91,7 @@ with =getopt-error?=.
 
 :::
 
-The procedure =getopt-display-help= can be used to display a help
+The procedure ~getopt-display-help~ can be used to display a help
 message for a getopt error according to the argument specification.
 
 *** getopt-display-help-topic
@@ -104,7 +106,7 @@ message for a getopt error according to the argument specification.
 
 :::
 
-The procedure =getopt-display-help-topic= can be used to display a help
+The procedure ~getopt-display-help-topic~ can be used to display a help
 page for a subcommand.
 
 *** getopt?
@@ -141,7 +143,7 @@ Returns true if the object is a getopt command or command specifier.
    :PROPERTIES:
    :CUSTOM_ID: example
    :END:
-For an example, here is a command line parser for the =gxpkg= program:
+For an example, here is a command line parser for the ~gxpkg~ program:
 
 #+begin_src scheme
   (def (main . args)

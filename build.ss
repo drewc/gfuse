@@ -31,11 +31,12 @@
 (def (copy-compiled file)
   (def libpath (path-expand (string-append "drewc/fuse/" file) libdir))
   (create-directory* (path-directory libpath))
+  (when (file-exists? file)
   (message "... copy " file " to " libpath)
 
   (when (file-exists? libpath)
     (delete-file libpath))
-  (copy-file file libpath))
+  (copy-file file libpath)))
 
 (def (copy-static file)
   (def spath (path-expand file statdir))
@@ -79,6 +80,7 @@
 (def (premade path)
   (def posts
     '("__0.o1"
+      "__1.o1"
       "__rt.o1"
       ".ssi"
       ".ssxi.ss"))
@@ -94,12 +96,14 @@
 
 (def (local-build)
   (defbuild-script
-    `(                                  ; "c2ffi-libfuse"
+    `((gxc: "getopt")                                 ; "c2ffi-libfuse"
       ,(fgxc "opt")
-      ,(fgxc "examples/try-main-hello")
-      ,(fgxc "examples/first-hello")
-      ,(fgxc "examples/second-hello")
-      ,(fgxc "examples/gfuse-read-hello")
+      ;; ,(fgxc "examples/try-main-hello")
+      ;; ,(fgxc "examples/first-hello")
+      ;; ,(fgxc "examples/second-hello")
+      ;; ,(fgxc "examples/gfuse-read-hello")
+      ;; ,(fgxc "examples/gfuse-getopt-hello")
+      ,(fgxc "examples/gfuse-operations-hello")
        ;; ,(let (libs (cddr (fgxc "asd")))
        ;;   ;; (displayln " Libs ~a" libs)
        ;;   `(gxc: "examples/gfuse-read-hello"
@@ -123,7 +127,11 @@
 (def (build-exes)
   (defbuild-script
     `((exe: ,@(cdr (fgxc "examples/first-hello")))
-      (static-exe: ,@(cdr (fgxc "examples/second-hello")))
+      ;(static-exe:(cdr (fgxc "examples/second-hello")))
+      ;; (static-exe: "examples/second-hello" ,@-cc-ld)
+      ;; (static-exe: "examples/gfuse-read-hello" ,@-cc-ld)
+      ;; (static-exe: "examples/gfuse-getopt-hello" ,@-cc-ld)
+      (static-exe: "examples/gfuse-operations-hello" ,@-cc-ld)
       #;(static-exe: ,@(cdr (fgxc "examples/gfuse-read-hello"
                                 "-flat")))
       )
@@ -133,13 +141,17 @@
   (main))
 
 (def (make-install)
+ (premade "getopt")
  (premade "opt")
- (premade "examples/try-main-hello")
- (premade "examples/first-hello")
- (premade "examples/second-hello")
- (premade "examples/gfuse-read-hello")
+ ;; (premade "examples/try-main-hello")
+ ;; (premade "examples/first-hello")
+ ;; (premade "examples/second-hello")
+ ;; (premade "examples/gfuse-read-hello")
+ ;; (premade "examples/gfuse-getopt-hello")
+ (premade "examples/gfuse-operations-hello")
  (for-each copy-static
-           (directory-files (path-expand "static/" (path-directory (this-source-file))))))
+           (directory-files
+            (path-expand "static/" (path-directory (this-source-file))))))
 
 
 (def (main . args)
@@ -150,6 +162,6 @@
       (make-clean)
       (local-build)
       (make-install)
-      (g-compile-static-exe "examples/gfuse-read-hello")
+      ;; (g-compile-static-exe "examples/gfuse-read-hello")
       (build-exes)
       (make-install)))))

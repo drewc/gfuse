@@ -1324,6 +1324,473 @@ int _main(int argc, char *argv[])
 
 #+end_src
 
+*** All C -> Scheme!
+
+Last time around we minimized the C file. It's now time to go even further with
+that.
+
+We want all functions to be gerbil. Here's what the FS has.
+
+#+begin_src c
+static const struct fuse_operations hello_oper = {
+	.init           = hello_init,
+	.getattr	= hello_getattr,
+	.readdir	= hello_readdir,
+	.open		= hello_open,
+	.read		= hello_read,
+};
+#+end_src
+
+We'll use gerbil's structs and methods.
+
+#+begin_src scheme :noweb-ref struct-fuse-operations
+(defstruct fuse-operations ())
+(set! current-fuse-operations
+  (make-parameter (make-fuse-operations)))
+#+end_src
+
+Now create a struct instance to use.
+
+#+begin_src scheme :noweb-ref old-hello-oper
+(def hello-oper (make-fuse-operations))
+(current-fuse-operations hello-oper)
+#+end_src
+
+And a *C* function to return it.
+
+#+begin_src scheme :noweb-ref fuse_operations
+(c-define
+ (current_gfuse_operations) ()
+  scheme-object "current_gfuse_operations" ""
+  (current-fuse-operations))
+#+end_src
+
+**** ~{init}~
+
+#+begin_quote
+◆ init
+void *(* fuse_operations::init)(struct fuse_conn_info *conn, struct fuse_config *cfg)
+
+Initialize filesystem
+
+The return value will passed in the private_data field of struct fuse_context to
+all file operations, and as a parameter to the destroy() method. It overrides
+the initial value provided to fuse_main() / fuse_new().
+#+end_quote
+
+What are the structs? The ~fuse_config~ seems relevant.
+
+#+begin_src c
+static void *hello_init(struct fuse_conn_info *conn,
+			struct fuse_config *cfg)
+{
+	(void) conn;
+  cfg->kernel_cache = 1;
+	return NULL;
+}
+#+end_src
+
+But we don't care much about either of them to start with, but we do need to
+ensure them and define the kernel_cache.
+
+We do not want to ~free()~ the struct.
+
+#+begin_src scheme :noweb-ref fuse_operations
+(c-declare #<<END-C
+#ifndef ___HAVE_FFI_NOFREE
+#define ___HAVE_FFI_NOFREE
+___SCMOBJ ffi_nofree (void *ptr)
+{
+ return ___FIX (___NO_ERR);
+}
+#endif
+END-C
+)
+#+end_src
+
+#+begin_src scheme :noweb-ref fuse_operations
+(define-c-struct fuse_conn_info () "ffi_nofree")
+(define-c-struct fuse_config ((kernel_cache . int))
+  "ffi_nofree")
+#+end_src
+
+Now the FFI calls a ~C~ function that is created from scheme.
+
+#+begin_src c :noweb-ref gfuse-operations-hello-init :noweb yes
+<<scm_fuse_operations>>
+___SCMOBJ current_gfuse_operations();
+void gfuse_operations_init(long int,  struct fuse_conn_info *, struct fuse_config *);
+static void *hello_init(struct fuse_conn_info *conn,
+			struct fuse_config *cfg)
+{
+
+    fprintf(stderr, "Calling gfuse_operations_init \n");
+    fflush(stderr);
+    gfuse_operations_init(current_gfuse_operations(), conn, cfg);
+    fflush(stderr);
+    fprintf(stderr, "Finished gfuse_operations_init \n");
+	return NULL;
+}
+#+end_src
+
+#+begin_src scheme :noweb-ref fuse_operations
+(c-define
+ (gfuse_operations_init gfo conn cfg) (scheme-object fuse_conn_info* fuse_config*)
+  void "gfuse_operations_init" "" (fuse-operations-init gfo conn cfg))
+#+end_src
+
+The scheme function sets the cache.
+
+#+begin_src scheme :noweb-ref fuse-operations
+(defmethod {init fuse-operations}
+  (lambda (self conn cf)
+    (set! (fuse_config-kernel_cache cf) 1)
+    []))
+
+(set! fuse-operations-init
+     (lambda (s c f)
+      ;; (display "HERE IN INIT FFS")
+       {init s c f}))
+#+end_src
+
+In a ~fork()~'d process any attempt to ~display~ hangs. That's important to keep
+in mind. Hence the comment. It does work though!
+
+
+**** ~{readdir}~
+
+There's a pointer to a *C* function, ~fuse_fill_dir_t~.
+
+#+begin_quote
+fuse_fill_dir_t
+
+typedef int(* fuse_fill_dir_t) (void *buf, const char *name, const struct stat *stbuf, off_t off, enum fuse_fill_dir_flags flags)
+
+Function to add an entry in a readdir() operation
+
+The off parameter can be any non-zero value that enables the filesystem to identify the current point in the directory stream. It does not need to be the actual physical position. A value of zero is reserved to indicate that seeking in directories is not supported.
+
+Parameters
+buf	the buffer passed to the readdir() operation
+name	the file name of the directory entry
+stbuf	file attributes, can be NULL
+off	offset of the next entry or zero
+flags	fill flags
+Returns
+1 if buffer is full, zero otherwise
+Definition at line 85 of file fuse.h.
+#+end_quote
+
+We can't call that in *Gambit* AFAIK so we'll make a function to call it.
+
+#+begin_src scheme :noweb-ref fuse_operations
+(c-define-type fuse_fill_dir_t "fuse_fill_dir_t")
+(c-define-type fuse_fill_dir_t* (pointer fuse_fill_dir_t))
+(c-define-type stat (struct "stat"))
+(c-define-type stat* (pointer stat))
+(c-define-type off_t int)
+(define-c-struct fuse_file_info () "ffi_nofree")
+
+(define-c-lambda fuse_fill_dir
+  (fuse_fill_dir_t (pointer void) char-string stat* off_t int)
+  int "
+int ret = ___arg1(___arg2, ___arg3, ___arg4, ___arg5, ___arg6);
+___return(ret);
+")
+#+end_src
+
+Now the idea is simple, right? Here's the existing ~hello_readdir~.
+
+#+begin_src c
+static int hello_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+			 off_t offset, struct fuse_file_info *fi,
+			 enum fuse_readdir_flags flags)
+{
+	(void) offset;
+	(void) fi;
+	(void) flags;
+
+    char* name = gfuse_file_name();
+
+    if (strcmp(path, "/") != 0)
+		return -ENOENT;
+
+	filler(buf, ".", NULL, 0, 0);
+	filler(buf, "..", NULL, 0, 0);
+	filler(buf, name ,NULL, 0, 0);
+
+
+	return 0;
+}
+#+end_src
+
+We'll ignore the file for the default and just return the ~.~ and ~..~
+
+#+begin_src scheme :noweb-ref fuse-operations
+
+(defmethod {readdir fuse-operations}
+  (lambda (self path buf fd off fi flags)
+    (if (not (string=? path "/")) (-ENOENT)
+        (begin
+          (fuse_fill_dir fd buf "." #f 0 0)
+          (fuse_fill_dir fd buf ".." #f 0 0)
+          0))))
+
+(set! fuse-operations-readdir
+  (lambda (self p b f o fi fl) {readdir self p b f o fi fl}))
+
+#+end_src
+
+That also requires ~-ENOENT~.
+
+#+begin_src scheme :noweb-ref fuse_operations
+(define-c-lambda -ENOENT () int "___return(-ENOENT);")
+#+end_src
+
+Now the *C* interface.
+
+#+begin_src scheme :noweb-ref fuse_operations
+(c-define
+ (gfuse_operations_readdir gfo path buff fd off fi flags)
+ (scheme-object char-string (pointer void)
+                fuse_fill_dir_t off_t fuse_file_info* int)
+  int "gfuse_operations_readdir" ""
+  (fuse-operations-readdir gfo path buff fd off fi flags))
+#+end_src
+
+#+begin_src c :noweb-ref gfuse-operations-readdir
+int gfuse_operations_readdir (___SCMOBJ,char*,void*,fuse_fill_dir_t ,int,struct fuse_file_info*,int);
+
+static int hello_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags)
+{
+  int ret = gfuse_operations_readdir(current_gfuse_operations(),
+                                     (char *) path, buf, filler, offset, fi, flags);
+  return ret;
+}
+#+end_src
+
+In our ~hello_readdir~ there should also be a file. We'll make a substruct and try a next-method.
+
+#+begin_src scheme :noweb-ref hello-oper
+(defstruct (hello-fuse-operations fuse-operations) ())
+(def hello-oper (make-hello-fuse-operations))
+(current-fuse-operations hello-oper)
+#+end_src
+
+Now a submethod.
+
+#+begin_src scheme :noweb-ref fuse-operations
+
+(defmethod {readdir hello-fuse-operations}
+  (lambda (self path buf fd off fi flags)
+    (def ret (@next-method self path buf fd off fi flags))
+    (if (not (zero? ret)) ret
+        (begin (fuse_fill_dir fd buf file-name #f 0 0)
+          0))))
+
+#+end_src
+
+It works.
+
+#+begin_src shell
+$ sudo ./bin/gfuse-operations-hello --name 'hello-gerbil' --contents $'This is the new contents you know \n' -o allow_other  /tmp/gfuse-test
+$ ls /tmp/gfuse-test/ -a
+./  ../  hello-gerbil
+$ cat /tmp/gfuse-test/hello-gerbil
+This is the new contents you know
+$ sudo umount -f /tmp/gfuse-test
+#+end_src
+
+**** ~gfuse_read~ part II AKA ~{read}~
+
+#+begin_src c :noweb-ref c-gfuse-operations-read
+
+static int gfuse_operations_read(___SCMOBJ, char *path, char *buf, long unsigned int,  int, struct fuse_file_info*);
+
+static int hello_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
+{
+  int ret = gfuse_operations_read(current_gfuse_operations(),
+                       (char *)path, buf, size, offset, fi);
+  return ret;
+
+};
+#+end_src
+
+#+begin_src scheme :noweb-ref fuse_operations
+
+(c-define
+ (gfuse_operations_read gfo path buf size offset fi)
+ (scheme-object char-string (pointer char) size_t off_t fuse_file_info*)
+ int "gfuse_operations_read" ""
+ (fuse-operations-read gfo path buf size offset fi))
+#+end_src
+
+For the default we'll simply say it does not exist.
+
+#+begin_src scheme :noweb-ref fuse-operations
+(defmethod {read fuse-operations}
+  (lambda _ (-ENOENT)))
+(set! fuse-operations-read
+  (lambda (gfo path buf size offset fi)
+    {read gfo path buf size offset fi}))
+#+end_src
+
+
+#+begin_src scheme :tangle ./examples/gfuse-operations-hello.ss :noweb yes
+(export (import: ../opt) main)
+(import :std/foreign :gerbil/gambit/foreign ../opt :gerbil/gambit
+        :std/misc/list :std/getopt :std/srfi/1)
+(declare (not optimize-dead-definitions))
+
+(begin-ffi (%main fuse_args* gfuse-read
+            file-contents file-name fuse-operations-init
+            fuse_config fuse_config* (struct fuse_config kernel_cache)
+            current-fuse-operations fuse_fill_dir -ENOENT
+            fuse-operations-readdir fuse-operations-read)
+(c-declare "#define FUSE_USE_VERSION 31")
+(c-declare "#include <fuse.h>")
+(c-declare "#include <fuse_opt.h>")
+
+<<hello-gfuse-file-size>>
+
+<<hello-gfuse-file-name>>
+
+(c-declare "#include \"gfuse_operations-hello.c\"")
+
+<<second-contents-fn>>
+<<extern-c-struct>>
+
+(extern-c-struct fuse_args)
+
+<<fuse_operations>>
+
+(define-c-lambda %main (fuse_args*) int "
+int res = _main(___arg1->argc, ___arg1->argv);
+___return(res);")
+
+) ;; /begin-ffi
+
+<<getopts->fuse>>
+
+<<first-go>>
+
+<<struct-fuse-operations>>
+
+<<hello-oper>>
+
+<<fuse-operations>>
+
+(def (main . args)
+  (def go-args (getopt-parse go args))
+  (def fargs (getopts->fuse go-args))
+
+
+  (%main (fuse_args<-list
+          [(car ##processed-command-line) fargs ...])))
+
+
+
+
+#+end_src
+
+
+
+**** /File/ ~examples/gfuse_operations-hello.c~
+:PROPERTIES:
+:CUSTOM_ID: exFuseGetoptHello
+:END:
+
+#+begin_src c :tangle ./examples/gfuse_operations-hello.c :noweb yes
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU GPLv2.
+  See the file COPYING.
+,*/
+
+/** @file
+ ,*
+ ,* minimal example filesystem using high-level API
+ ,*
+ ,* Compile with:
+ ,*
+ ,*     gcc -Wall hello.c `pkg-config fuse3 --cflags --libs` -o hello
+ ,*
+ ,* ## Source code ##
+ ,* \include hello.c
+ ,*/
+
+
+#define FUSE_USE_VERSION 31
+
+#include <fuse.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stddef.h>
+#include <assert.h>
+#include <unistd.h>
+
+<<gfuse-operations-hello-init>>
+
+<<gfuse-getopt-getattr>>
+
+<<gfuse-operations-readdir>>
+
+static int hello_open(const char *path, struct fuse_file_info *fi)
+{
+
+    char* name = gfuse_file_name();
+	if (strcmp(path+1, name) != 0)
+		return -ENOENT;
+
+	if ((fi->flags & O_ACCMODE) != O_RDONLY)
+		return -EACCES;
+
+	return 0;
+}
+<<c-gfuse-operations-read>>
+
+static const struct fuse_operations hello_oper = {
+	.init           = hello_init,
+	.getattr	= hello_getattr,
+	.readdir	= hello_readdir,
+	.open		= hello_open,
+	.read		= hello_read,
+};
+
+/*    /\* int out = open("cout.log", O_RDWR|O_CREAT|O_APPEND, 0600); *\/ */
+/*    /\*  if (-1 == out) { perror("opening cout.log"); return 255; } *\/ */
+
+/*      int err = open("cerr.log", O_RDWR|O_CREAT|O_APPEND, 0600); */
+/*      if (-1 == err) { perror("opening cerr.log"); return 255; } */
+
+/*    /\*  int save_out = dup(fileno(stdout)); *\/ */
+/*      int save_err = dup(fileno(stderr)); */
+
+/*    /\*  if (-1 == dup2(out, fileno(stdout))) { perror("cannot redirect stdout"); return 255; } *\/ */
+/*      if (-1 == dup2(err, fileno(stderr))) { perror("cannot redirect stderr"); return 255; } */
+
+int _main(int argc, char *argv[])
+{
+	int ret;
+	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+
+
+	/* Parse options */
+	if (fuse_opt_parse(&args, NULL, NULL, NULL) == -1) {
+		return 1;
+    }
+
+	ret = fuse_main(args.argc, args.argv, &hello_oper, NULL);
+	fuse_opt_free_args(&args);
+	return ret;
+}
+
+#+end_src
+
 *** /File/ ~examples/gfuse_read-hello.c~
 :PROPERTIES:
 :CUSTOM_ID: exFuseReadHello
@@ -1991,11 +2458,12 @@ echo "))" >> $_file
   (defbuild-script
     `((gxc: "getopt")                                 ; "c2ffi-libfuse"
       ,(fgxc "opt")
-      ,(fgxc "examples/try-main-hello")
-      ,(fgxc "examples/first-hello")
-      ,(fgxc "examples/second-hello")
-      ,(fgxc "examples/gfuse-read-hello")
-      ,(fgxc "examples/gfuse-getopt-hello")
+      ;; ,(fgxc "examples/try-main-hello")
+      ;; ,(fgxc "examples/first-hello")
+      ;; ,(fgxc "examples/second-hello")
+      ;; ,(fgxc "examples/gfuse-read-hello")
+      ;; ,(fgxc "examples/gfuse-getopt-hello")
+      ,(fgxc "examples/gfuse-operations-hello")
        ;; ,(let (libs (cddr (fgxc "asd")))
        ;;   ;; (displayln " Libs ~a" libs)
        ;;   `(gxc: "examples/gfuse-read-hello"
@@ -2020,9 +2488,10 @@ echo "))" >> $_file
   (defbuild-script
     `((exe: ,@(cdr (fgxc "examples/first-hello")))
       ;(static-exe:(cdr (fgxc "examples/second-hello")))
-      (static-exe: "examples/second-hello" ,@-cc-ld)
-      (static-exe: "examples/gfuse-read-hello" ,@-cc-ld)
-      (static-exe: "examples/gfuse-getopt-hello" ,@-cc-ld)
+      ;; (static-exe: "examples/second-hello" ,@-cc-ld)
+      ;; (static-exe: "examples/gfuse-read-hello" ,@-cc-ld)
+      ;; (static-exe: "examples/gfuse-getopt-hello" ,@-cc-ld)
+      (static-exe: "examples/gfuse-operations-hello" ,@-cc-ld)
       #;(static-exe: ,@(cdr (fgxc "examples/gfuse-read-hello"
                                 "-flat")))
       )
@@ -2034,11 +2503,12 @@ echo "))" >> $_file
 (def (make-install)
  (premade "getopt")
  (premade "opt")
- (premade "examples/try-main-hello")
- (premade "examples/first-hello")
- (premade "examples/second-hello")
- (premade "examples/gfuse-read-hello")
- (premade "examples/gfuse-getopt-hello")
+ ;; (premade "examples/try-main-hello")
+ ;; (premade "examples/first-hello")
+ ;; (premade "examples/second-hello")
+ ;; (premade "examples/gfuse-read-hello")
+ ;; (premade "examples/gfuse-getopt-hello")
+ (premade "examples/gfuse-operations-hello")
  (for-each copy-static
            (directory-files
             (path-expand "static/" (path-directory (this-source-file))))))
